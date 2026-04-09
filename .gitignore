@@ -8,10 +8,6 @@ pyssht-wheels
 profiling/*.txt
 quflow.egg-info
 /simulations/
-/notebooks/*
-!/notebooks/basic-example/basic-example.ipynb
-!/notebooks/basic-cluster-simulation/basic-cluster-simulation.ipynb
-!/notebooks/constraint-cluster-simulation/constraint-cluster-simulation.ipynb
 *cpython*.pyc
 quflow.code-workspace
 /.pytest_cache
@@ -24,6 +20,11 @@ data/logo.afdesign
 quflow/splittingflow.py
 quflow/integrators/isomp-old.py
 quflow/templates/run_reverse_TEMPLATE.py
+*.mp4
+*.hdf5
+*.sqlite
+*mysim_runfile.py
+*run_vera.sh
 
 # Local user environment artifacts
 /.cache/
