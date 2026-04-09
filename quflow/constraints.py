@@ -14,6 +14,13 @@ Two constraint-extraction methods are available:
   - "svd"  : computes a truncated SVD of C to obtain a dense but
              well-conditioned constraint basis (slower, dense block).
 
+Constraint-matrix construction options:
+  - default : build C from the single truncated matrix F_c via [F_c, P] = 0.
+  - each_eigenvector=True : build C from the rank-1 projector constraints
+             [e_i e_i^H, P] = 0 for every eigenvector e_i whose eigenvalue
+             in F_c is nonzero. This tracks the per-eigenvector condition
+             directly and is typically denser.
+
 Four solver strategies are available:
   - "direct"   : sparse LU factorization of the full KKT saddle-point
                   matrix.  Pairs naturally with method="lu" (sparse V
@@ -106,20 +113,27 @@ def rank_from_eigenvalues(F, tol=1e-10):
     return rank, counts.tolist()
 
 
-def truncate_to_level_set(F, center, epsilon):
+def truncate_to_level_set(F, center, epsilon, linear=False):
     """
-    Keep only the eigenvalues of F whose imaginary part falls in
-    (center - epsilon, center + epsilon). All other eigenvalues
-    are set to exactly zero.
+    Keep only the eigenvectors of F whose eigenvalues lie in the band
+    [center - epsilon, center + epsilon], and zero out the rest.
+
+    If linear=False, retain the original eigenvalues inside the band.
+
+    If linear=True, replace the retained eigenvalues by distinct nonzero
+    values 1j * 1, 1j * 2, ..., 1j * K, so that none of the kept modes
+    merges with the discarded zero eigenspace.
 
     Parameters
     ----------
     F : ndarray, shape (N, N)
-        Skew-Hermitian matrix (quantized function).
+        Skew-Hermitian matrix.
     center : float
-        Target imaginary eigenvalue.
+        Target level-set value (imaginary part).
     epsilon : float
-        Half-width of the band.
+        Half-width of the retained band.
+    linear : bool, default False
+        Whether to remap the retained eigenvalues to distinct nonzero values.
 
     Returns
     -------
@@ -128,12 +142,21 @@ def truncate_to_level_set(F, center, epsilon):
     K : int
         Number of retained eigenvalues.
     """
-    eigvals, eigvecs = np.linalg.eig(F)
-    mask = (center - epsilon <= eigvals.imag) & (eigvals.imag < center + epsilon)
+    # Since F is skew-Hermitian, -1j*F is Hermitian with real eigenvalues.
+    eigvals, eigvecs = np.linalg.eigh(-1j * F)
+
+    mask = (center - epsilon <= eigvals) & (eigvals <= center + epsilon)
     K = int(np.sum(mask))
-    eigvals_out = np.where(mask, eigvals, 0.0)
-    F_c = (eigvecs * eigvals_out[None, :]) @ eigvecs.conj().T
+
+    eigvals_out = np.zeros_like(eigvals)
+    if linear:
+        eigvals_out[mask] = np.arange(1, K + 1, dtype=eigvals.dtype)
+    else:
+        eigvals_out[mask] = eigvals[mask]
+
+    F_c = eigvecs @ (1j * np.diag(eigvals_out)) @ eigvecs.conj().T
     return F_c, K
+
 
 
 def quantize_to_three_levels(F, targets=(-1.0, 0.0, 1.0), tol=1e-10):
@@ -294,6 +317,9 @@ class CoastlinePoisson:
         Matrix bandwidth.
     method : str, "lu", "qr", or "svd"
         How to extract the constraint rows.
+    each_eigenvector : bool
+        If True, build the constraint matrix from the nonzero-eigenvalue
+        rank-1 projectors of F_c rather than from F_c itself.
     solver : str, "direct", "schur", "schur_cg", or "minres"
         "direct"   -- sparse LU of the full KKT saddle-point system.
         "schur"    -- explicit Schur complement (dense m x m LU factor).
@@ -309,24 +335,36 @@ class CoastlinePoisson:
     """
 
     def __init__(self, F_c, N=None, method="lu", solver="direct",
+                 each_eigenvector=False,
                  cg_tol=1e-12, cg_maxiter=None, verbose=True):
         if N is None:
             N = F_c.shape[0]
         self.N = N
         self.method = method
         self.solver_type = solver
+        self.each_eigenvector = each_eigenvector
         self.solve_count = 0
         self.setup_diagnostics = {}
         self.last_solve_diagnostics = {}
-
-        # Commutator matrix
-        C = commutator_matrix(F_c, N)
 
         # Predicted rank
         rank, multiplicities = rank_from_eigenvalues(F_c)
         if verbose:
             print(f"N = {N},  rank(C) = {rank},  "
                   f"eigenvalue group sizes = {multiplicities}")
+
+        if each_eigenvector:
+            C = self._build_constraint_matrix_each_eigenvector(F_c, rank)
+            self.setup_diagnostics["constraint_matrix"] = {
+                "type": "each_eigenvector",
+                "shape": tuple(C.shape),
+            }
+        else:
+            C = commutator_matrix(F_c, N)
+            self.setup_diagnostics["constraint_matrix"] = {
+                "type": "commutator",
+                "shape": tuple(C.shape),
+            }
 
         # Build constraint rows V (full row rank, same null space as C)
         if method == "lu":
@@ -336,7 +374,10 @@ class CoastlinePoisson:
         elif method == "svd":
             V = self._build_constraint_svd(C, rank)
         else:
-            raise ValueError(f"Unknown method '{method}'. Use 'lu', 'qr', or 'svd'.")
+            raise ValueError(
+                f"Unknown method '{method}'. "
+                "Use 'lu', 'qr', or 'svd'."
+            )
 
         if solver == "direct":
             self._init_direct(V, N, verbose)
@@ -686,8 +727,68 @@ class CoastlinePoisson:
         return V
 
     @staticmethod
+    def _build_constraint_matrix_each_eigenvector(F_c, rank, tol=1e-10):
+        """Build constraint matrix from the nonzero eigenprojectors of F_c.
+
+        For each eigenvector ``e_i`` with nonzero eigenvalue, impose
+        ``[P, e_i e_i^H] = 0``. In the eigenbasis of ``F_c``, this means all
+        matrix entries touching the selected index ``i`` vanish, except the
+        diagonal entry ``P_ii``. The resulting constraint has rank
+        ``K(2N-K-1)`` when exactly ``K`` eigenvalues are nonzero.
+
+        The returned matrix is already full row rank and spans the intended
+        constraint row space. It can therefore be fed into ``lu``/``qr``/``svd``
+        as the constraint matrix ``C``.
+        """
+        H = 1j * F_c
+        evals, evecs = np.linalg.eigh(H)
+        selected = np.flatnonzero(np.abs(evals) > tol)
+        K = selected.size
+        N = F_c.shape[0]
+        expected_rank = K * (2 * N - K - 1)
+        if expected_rank != rank:
+            raise ValueError(
+                f"Expected rank {rank}, but nonzero-eigenvalue projector "
+                f"construction gives rank {expected_rank} (K={K})."
+            )
+
+        complement = np.setdiff1d(np.arange(N), selected, assume_unique=True)
+        rows = []
+
+        # Couplings between selected eigendirections and the complement.
+        for i in selected:
+            ei = evecs[:, i]
+            for j in complement:
+                ej = evecs[:, j]
+                rows.append(np.outer(np.conj(ei), ej).ravel())
+                rows.append(np.outer(np.conj(ej), ei).ravel())
+
+        # Off-diagonal couplings within the selected eigendirections.
+        for pos, i in enumerate(selected):
+            ei = evecs[:, i]
+            for j in selected[pos + 1 :]:
+                ej = evecs[:, j]
+                rows.append(np.outer(np.conj(ei), ej).ravel())
+                rows.append(np.outer(np.conj(ej), ei).ravel())
+
+        if len(rows) != rank:
+            raise RuntimeError(
+                f"Constructed {len(rows)} per-eigenvalue constraints, expected {rank}."
+            )
+
+        C = np.vstack(rows)
+        row_norms = np.linalg.norm(C, axis=1)
+        C /= np.maximum(row_norms[:, np.newaxis], 1e-30)
+        return sp.csr_matrix(C)
+
+    @staticmethod
     def _build_constraint_svd(C, rank):
         """Extract constraint basis via truncated SVD (dense result)."""
+        if C.shape[0] <= rank:
+            # C is already a full row-rank constraint matrix; return an
+            # orthonormal row basis for the same row space.
+            Q, _ = scipy.linalg.qr(C.toarray().T, mode="economic")
+            return sp.csr_matrix(Q.conj().T)
         _, S, Vt = spla.svds(C, k=rank)
         sort_idx = np.argsort(S)[::-1]
         Vt = Vt[sort_idx]

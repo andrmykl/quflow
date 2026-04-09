@@ -491,9 +491,11 @@ class Animation(object):
 
 
     def finish(self):
-        self.writer.finish()
+        if hasattr(self.writer, '_proc'):
+            self.writer.finish()
         # Close figure (so it doesn't show up interactively)
-        plt.close(fig=self.figure)
+        if hasattr(self, 'figure'):
+            plt.close(fig=self.figure)
 
         # if in_notebook():
         #     from IPython.display import Video
@@ -535,10 +537,7 @@ class Animation(object):
         if state is not None:
             if im is None:
                 # Create default plot
-                fun = as_fun(state)
-                if self.N is not None:
-                    fun = resample(fun, self.N)
-                self.im = plot(fun, **self._plot_kwargs)
+                self.im = plot(state, N=self.N, **self._plot_kwargs)
                 im = self.im
                 self.setup()
             else:
