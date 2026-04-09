@@ -25,6 +25,8 @@ quflow/templates/run_reverse_TEMPLATE.py
 *.sqlite
 *mysim_runfile.py
 *run_vera.sh
+*Marker*
+/.ipython/profile_default/
 
 # Local user environment artifacts
 /.cache/
