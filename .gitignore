@@ -11,6 +11,7 @@ quflow.egg-info
 /notebooks/*
 !/notebooks/basic-example/basic-example.ipynb
 !/notebooks/basic-cluster-simulation/basic-cluster-simulation.ipynb
+!/notebooks/constraint-cluster-simulation/constraint-cluster-simulation.ipynb
 *cpython*.pyc
 quflow.code-workspace
 /.pytest_cache
