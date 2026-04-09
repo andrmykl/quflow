@@ -23,3 +23,12 @@ data/logo.afdesign
 quflow/splittingflow.py
 quflow/integrators/isomp-old.py
 quflow/templates/run_reverse_TEMPLATE.py
+
+# Local user environment artifacts
+/.cache/
+/.cursor/
+/.cursor-server/
+/.devcontainer/
+/.gitconfig
+/.local/
+/.ssh/
