@@ -56,6 +56,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import scipy.linalg
 import quflow as qf
+from scipy.linalg import solve_continuous_lyapunov
 
 
 # ---------------------
@@ -1018,3 +1019,59 @@ class CoastlinePoisson:
     def solve_poisson(self, W):
         """Drop-in replacement for qf.solve_poisson (same signature)."""
         return self.solve(W)
+
+
+def island_mask(N, center, radius=1, p=2):
+    "Build mask for island w.r.t. p-norm."
+    theta, phi = np.meshgrid(np.linspace(0,np.pi, N), \
+                             np.linspace(0,2*np.pi, 2*N-1, endpoint=False), indexing='ij')
+    
+    
+    center = np.asarray(center)
+    center /= np.linalg.norm(center)
+
+    x = np.sin(theta)*np.cos(phi)
+    y = np.sin(theta)*np.sin(phi)
+    z = np.cos(theta)
+
+    return np.abs(x-center[0])**p + np.abs(y-center[1])**p + np.abs(z-center[2])**p < radius**p 
+
+
+def plot_with_countour(W,F, level_set):
+    return qf.plot(W, contour_data=F, contours=[level_set -0.02,level_set,level_set +0.02],colorbar=True)
+
+def plot_eigenvalues(F,greater_than=-np.inf, less_than=np.inf,):
+    Fvals, E = np.linalg.eigh(-1j*F)
+    a = [fval for fval in Fvals if fval >= greater_than and fval <= less_than]
+    qf.plot(F, contours=a,colorbar=True)
+
+
+
+def make_trace_free_on_U(X,F,coastline_center,coastline_epsilon):
+    E = scipy.linalg.orth(1j*F, rcond=1e-4)
+    Fvals, E = np.linalg.eigh(1j*F)
+    Fvals *= -1
+    threshold = coastline_center - coastline_epsilon
+    k = np.max(np.where(Fvals >= threshold)) + 1
+    Q = E[:, :k]
+    QH = Q.conj().T
+    U = E[:, k:]
+    UH = U.conj().T
+    fis = Fvals[:k]
+    fisrange = Fvals[k:]
+
+    XU = UH @ X @ U
+    XU -= np.trace(XU) * np.eye(U.shape[1]) / U.shape[1]
+    return U @ XU @ UH
+
+
+def project(W,F,coastline_center,coastline_epsilon):
+    return make_trace_free_on_U(W,F,coastline_center,coastline_epsilon)
+
+
+def project_soft(W,F,coastline_center,coastline_epsilon, epsilon=1e-4):
+    XpI = np.eye(W.shape[0]) - F * (1.0j / epsilon)
+    Wtilde = solve_continuous_lyapunov(XpI, 2 * W)
+    # Remove the trace only on the allowed U-subspace, so we do not
+    # add a constant in the blocked Q-region where the projection is zero.
+    return make_trace_free_on_U(Wtilde,F,coastline_center,coastline_epsilon)

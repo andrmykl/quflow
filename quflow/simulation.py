@@ -526,12 +526,19 @@ if args.endtime is not None:
 
 # Run simulation
 if not args.animate:
-    qf.solve(mysim)
+    qf.solve(mysim,hamiltonian=solver.solve)
 
 # Create animation
 if not args.simulate:
     animfile = filename.replace(".hdf5",".mp4")
-    with qf.QuSimulation(filename) as mysim, qf.Animation(animfile) as anim:
+    with qf.QuSimulation(filename) as mysim, qf.Animation(
+    animfile,
+    N=256,
+    contour_data=F,
+    contours=[level_set_center],
+    grid=False,
+    colorbar=True
+) as anim:
         for k in tqdm(range(0, len(mysim['time']), args.astride)):
             t = mysim['time', k]
             data = mysim['fun', k]
