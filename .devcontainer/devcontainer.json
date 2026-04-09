@@ -1,0 +1,27 @@
+{
+  "name": "Zeitlin (quflow)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace",
+  "runArgs": [
+    "--mount",
+    "type=bind,source=${localWorkspaceFolder},target=/workspace,z",
+    "--userns=keep-id"
+  ],
+  "postCreateCommand": "pip install -e /workspace",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  },
+  "forwardPorts": [8888]
+}

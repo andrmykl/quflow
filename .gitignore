@@ -30,7 +30,6 @@ quflow/templates/run_reverse_TEMPLATE.py
 /.cache/
 /.cursor/
 /.cursor-server/
-/.devcontainer/
 /.gitconfig
 /.local/
 /.ssh/
