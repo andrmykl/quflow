@@ -11,6 +11,15 @@ Two constraint-extraction methods are available:
   - "qr"   : selects independent sparse rows after row equilibration
              and broader candidate sampling. Usually better conditioned
              than "lu" while remaining sparse.
+  - "qr-simple" : applies pivoted QR directly to the transpose of the
+             nonzero rows and returns the selected sparse rows.
+  - "im"   : uses an interpolative decomposition of the commutator
+             operator itself (matrix-free from F_c) to select a sparse
+             skeleton row basis.
+  - "im-matrix" : applies interpolative decomposition to the explicitly
+             constructed row-equilibrated matrix C^H with ``rand=False``.
+  - "qd"   : uses a Q-DEIM selection on an orthonormal basis of the
+             row space to choose sparse constraint rows.
   - "svd"  : computes a truncated SVD of C to obtain a dense but
              well-conditioned constraint basis (slower, dense block).
 
@@ -28,6 +37,9 @@ Four solver strategies are available:
   - "schur"    : explicit Schur complement — forms and LU-factors the
                   dense m x m matrix S = V A_bc^{-1} V^H.  2 Poisson
                   solves per step; m Poisson solves at setup.
+  - "schur-poisson" : same Schur complement setup as "schur", but uses
+                  ``qf.laplacian.solve_poisson(..., bc=True)`` in the
+                  repeated solve phase.
   - "schur_cg" : CG on the Schur complement with a symmetric
                   regularization of A.  Preconditioned + warm-started.
   - "minres"   : MINRES on the **same** full KKT as ``direct`` (no
@@ -55,6 +67,7 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import scipy.linalg
+import scipy.linalg.interpolative
 import quflow as qf
 from scipy.linalg import solve_continuous_lyapunov
 
@@ -316,14 +329,16 @@ class CoastlinePoisson:
         Truncated coastline matrix (from `truncate_to_level_set`).
     N : int
         Matrix bandwidth.
-    method : str, "lu", "qr", or "svd"
+    method : str, "lu", "qr", "qr-simple", "im", "im-matrix", "qd", or "svd"
         How to extract the constraint rows.
     each_eigenvector : bool
         If True, build the constraint matrix from the nonzero-eigenvalue
         rank-1 projectors of F_c rather than from F_c itself.
-    solver : str, "direct", "schur", "schur_cg", or "minres"
+    solver : str, "direct", "schur", "schur-poisson", "schur_cg", or "minres"
         "direct"   -- sparse LU of the full KKT saddle-point system.
         "schur"    -- explicit Schur complement (dense m x m LU factor).
+        "schur-poisson" -- Schur complement with solve_poisson in the
+                           repeated inverse-Laplacian applications.
         "schur_cg" -- CG on the Schur complement (preconditioned).
         "minres"   -- MINRES on the full KKT system (real 2n form).
     cg_tol : float
@@ -354,35 +369,67 @@ class CoastlinePoisson:
             print(f"N = {N},  rank(C) = {rank},  "
                   f"eigenvalue group sizes = {multiplicities}")
 
-        if each_eigenvector:
-            C = self._build_constraint_matrix_each_eigenvector(F_c, rank)
+        if method == "im" and not each_eigenvector:
             self.setup_diagnostics["constraint_matrix"] = {
-                "type": "each_eigenvector",
-                "shape": tuple(C.shape),
+                "type": "commutator_linear_operator",
+                "shape": (N**2, N**2),
             }
+            V = self._build_constraint_im(F_c, rank)
         else:
-            C = commutator_matrix(F_c, N)
-            self.setup_diagnostics["constraint_matrix"] = {
-                "type": "commutator",
-                "shape": tuple(C.shape),
-            }
+            if each_eigenvector:
+                C = self._build_constraint_matrix_each_eigenvector(F_c, rank)
+                self.setup_diagnostics["constraint_matrix"] = {
+                    "type": "each_eigenvector",
+                    "shape": tuple(C.shape),
+                }
+            else:
+                C = commutator_matrix(F_c, N)
+                self.setup_diagnostics["constraint_matrix"] = {
+                    "type": "commutator",
+                    "shape": tuple(C.shape),
+                }
 
-        # Build constraint rows V (full row rank, same null space as C)
-        if method == "lu":
-            V = self._build_constraint_lu(C, rank)
-        elif method == "qr":
-            V = self._build_constraint_qr(C, rank)
-        elif method == "svd":
-            V = self._build_constraint_svd(C, rank)
-        else:
-            raise ValueError(
-                f"Unknown method '{method}'. "
-                "Use 'lu', 'qr', or 'svd'."
+            # Build constraint rows V (full row rank, same null space as C)
+            if method == "lu":
+                V = self._build_constraint_lu(C, rank)
+            elif method == "qr":
+                V = self._build_constraint_qr(C, rank)
+            elif method == "qr-simple":
+                V = self._build_constraint_qr_simple(C, rank)
+            elif method == "im":
+                V = self._build_constraint_im_from_matrix(C, rank)
+            elif method == "im-matrix":
+                V = self._build_constraint_im_matrix(C, rank)
+            elif method == "qd":
+                V = self._build_constraint_qd(C, rank)
+            elif method == "svd":
+                V = self._build_constraint_svd(C, rank)
+            else:
+                raise ValueError(
+                    f"Unknown method '{method}'. "
+                    "Use 'lu', 'qr', 'qr-simple', 'im', 'im-matrix', 'qd', or 'svd'."
+                )
+
+        V_nnz = int(V.nnz) if sp.issparse(V) else int(np.count_nonzero(V))
+        V_total = int(V.shape[0] * V.shape[1])
+        V_density = float(V_nnz / max(V_total, 1))
+        self.setup_diagnostics["constraint_basis"] = {
+            "method": method,
+            "shape": tuple(V.shape),
+            "nnz": V_nnz,
+            "density": V_density,
+        }
+        if verbose:
+            print(
+                f"Constraint basis V ({method}) shape={V.shape}, "
+                f"nnz={V_nnz}, density={V_density:.6e}"
             )
 
         if solver == "direct":
             self._init_direct(V, N, verbose)
         elif solver == "schur":
+            self._init_schur(V, N, cg_tol, verbose)
+        elif solver == "schur-poisson":
             self._init_schur(V, N, cg_tol, verbose)
         elif solver == "schur_cg":
             self._init_schur_cg(V, N, cg_tol, cg_maxiter, verbose)
@@ -391,7 +438,7 @@ class CoastlinePoisson:
         else:
             raise ValueError(
                 f"Unknown solver '{solver}'. "
-                "Use 'direct', 'schur', 'schur_cg', or 'minres'."
+                "Use 'direct', 'schur', 'schur-poisson', 'schur_cg', or 'minres'."
             )
 
     def _init_direct(self, V, N, verbose):
@@ -425,10 +472,11 @@ class CoastlinePoisson:
         """Set up Schur complement solver.
 
         Uses the Laplacian with BC (A_bc, nonsingular) as the inner
-        operator.  The Schur complement is  S = V A_bc^{-1} V^H,
-        formed explicitly and LU-factored.  No trace row is added
-        to V; instead tr(P) = 0 is enforced after the solve (adding
-        cI does not affect [F_c, P] since [F_c, I] = 0).
+        operator when assembling the Schur complement.  The Schur
+        complement is  S = V A_bc^{-1} V^H, formed explicitly and
+        LU-factored.  No trace row is added to V; instead tr(P) = 0 is
+        enforced after the solve (adding cI does not affect [F_c, P]
+        since [F_c, I] = 0).
         """
         self.V = V if sp.issparse(V) else sp.csr_matrix(V)
         self.n_constraints = V.shape[0]
@@ -635,7 +683,7 @@ class CoastlinePoisson:
         # Fast approximate inverse Laplacian from quflow's optimized backend.
         # MINRES requires SPD preconditioner. qf.solve_poisson behaves like
         # an inverse negative Laplacian in this convention, so flip sign.
-        yp = -qf.laplacian.solve_poisson(rp.reshape(N, N)).ravel()
+        yp = -qf.laplacian.solve_poisson(rp.reshape(N, N), bc=True).ravel()
         ylam = rlam / self._minres_lambda_scale
         y = np.concatenate([yp, ylam])
         return np.concatenate([y.real, y.imag])
@@ -723,6 +771,123 @@ class CoastlinePoisson:
         selected = candidate_idx[perm[:rank]]
 
         V = C_csr[selected, :].copy()
+        V_norms = np.sqrt(np.array(V.multiply(V.conj()).sum(axis=1)).real.ravel())
+        V = V.multiply((1.0 / np.maximum(V_norms, 1e-30))[:, np.newaxis])
+        return V
+
+    @staticmethod
+    def _build_constraint_qr_simple(C, rank):
+        """Select sparse rows via direct pivoted QR on all nonzero rows.
+
+        This is the minimal QR-based baseline: no oversampling and no
+        candidate preselection, only row equilibration followed by pivoted QR
+        on ``C_nz^H`` and extraction of the corresponding original sparse rows.
+        """
+        C_csr = C.tocsr()
+        row_norms = np.sqrt(np.array(C_csr.multiply(C_csr.conj()).sum(axis=1)).real.ravel())
+        nonzero_idx = np.flatnonzero(row_norms > 0)
+        if nonzero_idx.size < rank:
+            raise ValueError(
+                f"Constraint matrix has only {nonzero_idx.size} nonzero rows, "
+                f"cannot extract rank {rank}."
+            )
+
+        C_nz = C_csr[nonzero_idx, :]
+        scales = 1.0 / np.maximum(row_norms[nonzero_idx], 1e-30)
+        C_eq = C_nz.multiply(scales[:, np.newaxis])
+        _, _, perm = scipy.linalg.qr(C_eq.toarray().T, pivoting=True, mode="economic")
+        selected = nonzero_idx[np.asarray(perm[:rank], dtype=int)]
+
+        V = C_csr[selected, :].copy()
+        V_norms = np.sqrt(np.array(V.multiply(V.conj()).sum(axis=1)).real.ravel())
+        V = V.multiply((1.0 / np.maximum(V_norms, 1e-30))[:, np.newaxis])
+        return V
+
+    @staticmethod
+    def _build_constraint_im_from_matrix(C, rank):
+        """Select a sparse row basis via explicit-matrix interpolative decomposition.
+
+        This applies ID directly to the adjoint of the explicitly constructed
+        constraint matrix and uses deterministic pivoting (``rand=False``).
+        """
+        C_csr = C.tocsr()
+        row_norms = np.sqrt(
+            np.array(C_csr.multiply(C_csr.conj()).sum(axis=1)).real.ravel()
+        )
+        nonzero_idx = np.flatnonzero(row_norms > 0)
+        if nonzero_idx.size < rank:
+            raise ValueError(
+                f"Constraint matrix has only {nonzero_idx.size} nonzero rows, "
+                f"cannot extract rank {rank}."
+            )
+
+        C_nz = C_csr[nonzero_idx, :].copy()
+        C_nz_H = C_nz.conj().transpose().tocsr()
+        A = spla.LinearOperator(
+            shape=C_nz_H.shape,
+            matvec=lambda x: C_nz_H.dot(x),
+            rmatvec=lambda x: C_nz_H.conj().transpose().dot(x),
+            dtype=C_nz_H.dtype,
+        )
+
+        idx, _ = scipy.linalg.interpolative.interp_decomp(A, rank, rand=False)
+        selected = nonzero_idx[np.asarray(idx[:rank], dtype=int)]
+
+        V = C_csr[selected, :].copy()
+        V_norms = np.sqrt(np.array(V.multiply(V.conj()).sum(axis=1)).real.ravel())
+        V = V.multiply((1.0 / np.maximum(V_norms, 1e-30))[:, np.newaxis])
+        return V
+
+    @staticmethod
+    def _build_constraint_im_matrix(C, rank):
+        """Explicit-matrix ID path for comparing against matrix-free ``method="im"``."""
+        return CoastlinePoisson._build_constraint_im_from_matrix(C, rank)
+
+    @staticmethod
+    def _build_constraint_im(F_c, rank):
+        """Select a sparse row basis via matrix-free interpolative decomposition.
+
+        The ID is applied to the adjoint commutator operator ``C^H`` without
+        forming the Kronecker commutator matrix ``C`` explicitly. Skeleton
+        column indices of ``C^H`` are then converted into explicit sparse rows
+        of ``C`` using the row/column structure of the commutator.
+        """
+        selected = interpolative_constraint_indices(F_c, rank)
+        V = selected_commutator_rows(F_c, selected)
+        V_norms = np.sqrt(np.array(V.multiply(V.conj()).sum(axis=1)).real.ravel())
+        V = V.multiply((1.0 / np.maximum(V_norms, 1e-30))[:, np.newaxis])
+        return V
+
+    @staticmethod
+    def _build_constraint_qd(C, rank):
+        """Select sparse rows using a Q-DEIM pivoting strategy.
+
+        A rank-``rank`` orthonormal basis ``U`` for the row space of ``C`` is
+        first computed from ``C^H``. Pivoted QR on ``U^T`` then selects row
+        indices, which are mapped back to actual sparse rows of ``C``.
+        """
+        C_csr = C.tocsr()
+        row_norms = np.sqrt(
+            np.array(C_csr.multiply(C_csr.conj()).sum(axis=1)).real.ravel()
+        )
+        nonzero_idx = np.flatnonzero(row_norms > 0)
+        if nonzero_idx.size < rank:
+            raise ValueError(
+                f"Constraint matrix has only {nonzero_idx.size} nonzero rows, "
+                f"cannot extract rank {rank}."
+            )
+
+        C_nz = C_csr[nonzero_idx, :].copy()
+        if C_nz.shape[0] == rank:
+            V = C_nz
+        else:
+            U, svals, _ = spla.svds(C_nz.conj().transpose(), k=rank)
+            sort_idx = np.argsort(svals)[::-1]
+            U = U[:, sort_idx]
+            _, _, perm = scipy.linalg.qr(U.conj().T, pivoting=True, mode="economic")
+            selected = nonzero_idx[np.asarray(perm[:rank], dtype=int)]
+            V = C_csr[selected, :].copy()
+
         V_norms = np.sqrt(np.array(V.multiply(V.conj()).sum(axis=1)).real.ravel())
         V = V.multiply((1.0 / np.maximum(V_norms, 1e-30))[:, np.newaxis])
         return V
@@ -820,6 +985,8 @@ class CoastlinePoisson:
                 P = self._solve_direct(Wi)
             elif self.solver_type == "schur":
                 P = self._solve_schur(Wi)
+            elif self.solver_type == "schur-poisson":
+                P = self._solve_schur_poisson(Wi)
             elif self.solver_type == "schur_cg":
                 P = self._solve_schur_cg(Wi)
             elif self.solver_type == "minres":
@@ -870,6 +1037,41 @@ class CoastlinePoisson:
         P -= np.trace(P) / N * np.eye(N)
         self._update_last_solve_diagnostics({
             "solver": "schur",
+            "rhs_norm": float(np.linalg.norm(W)),
+            "p0_norm": float(np.linalg.norm(p0)),
+            "schur_rhs_norm": float(np.linalg.norm(b)),
+            "lambda_norm": float(np.linalg.norm(lam)),
+            "correction_norm": float(np.linalg.norm(correction)),
+            "constraint_residual_norm": float(np.linalg.norm(constraint_residual)),
+            "constraint_residual_rel": float(
+                np.linalg.norm(constraint_residual) / max(np.linalg.norm(p), 1e-30)
+            ),
+            "trace_before_projection": complex(trace_before_projection),
+            "solution_norm": float(np.linalg.norm(P)),
+        })
+        return P
+
+    def _solve_schur_poisson(self, W):
+        """Schur solve variant using qf.laplacian.solve_poisson per RHS."""
+        N = self.N
+        V = self.V
+
+        p0 = qf.laplacian.solve_poisson(W, bc=True).ravel()
+        b = V @ p0
+
+        lam = scipy.linalg.lu_solve(self._schur_factor, -b)
+
+        correction = V.conj().T @ lam
+        p = qf.laplacian.solve_poisson(
+            (W.ravel() - correction).reshape(N, N),
+            bc=True,
+        ).ravel()
+        constraint_residual = V @ p
+        P = p.reshape(N, N)
+        trace_before_projection = np.trace(P)
+        P -= np.trace(P) / N * np.eye(N)
+        self._update_last_solve_diagnostics({
+            "solver": "schur-poisson",
             "rhs_norm": float(np.linalg.norm(W)),
             "p0_norm": float(np.linalg.norm(p0)),
             "schur_rhs_norm": float(np.linalg.norm(b)),
@@ -1075,3 +1277,133 @@ def project_soft(W,F,coastline_center,coastline_epsilon, epsilon=1e-4):
     # Remove the trace only on the allowed U-subspace, so we do not
     # add a constant in the blocked Q-region where the projection is zero.
     return make_trace_free_on_U(Wtilde,F,coastline_center,coastline_epsilon)
+
+def matrix_commutator(A,B):
+    return A @ B - B @ A
+
+def matrix_commutator_from_F_linear_operator(F_c):
+    n_sq = F_c.shape[0] ** 2
+
+    def _matvec(x):
+        return matrix_commutator(F_c, x.reshape(F_c.shape)).ravel()
+
+    def _rmatvec(x):
+        X = x.reshape(F_c.shape)
+        return matrix_commutator(F_c.conj().T, X).ravel()
+
+    return spla.LinearOperator(
+        shape=(n_sq, n_sq),
+        matvec=_matvec,
+        rmatvec=_rmatvec,
+        dtype=F_c.dtype,
+    )
+
+def selected_commutator_rows(F_c, selected):
+    """Return explicit sparse commutator rows indexed by ``selected``.
+
+    Row ``(a, b)`` of the commutator map ``P -> F_c P - P F_c`` only touches
+    entries ``(j, b)`` and ``(a, j)`` of ``P``. This lets us reconstruct the
+    selected rows directly from row ``a`` and column ``b`` of ``F_c`` without
+    ever building the full Kronecker matrix.
+    """
+    N = F_c.shape[0]
+    n_sq = N * N
+    selected = np.asarray(selected, dtype=int)
+    rows = []
+    cols = []
+    vals = []
+
+    for row_pos, idx in enumerate(selected):
+        a = idx // N
+        b = idx % N
+
+        row_a = F_c[a, :]
+        nz_row = np.flatnonzero(np.abs(row_a) > 0)
+        rows.extend([row_pos] * nz_row.size)
+        cols.extend((nz_row * N + b).tolist())
+        vals.extend(row_a[nz_row].tolist())
+
+        col_b = F_c[:, b]
+        nz_col = np.flatnonzero(np.abs(col_b) > 0)
+        rows.extend([row_pos] * nz_col.size)
+        cols.extend((a * N + nz_col).tolist())
+        vals.extend((-col_b[nz_col]).tolist())
+
+    V = sp.coo_matrix((vals, (rows, cols)), shape=(selected.size, n_sq)).tocsr()
+    V.sum_duplicates()
+    V.eliminate_zeros()
+    return V
+
+def commutator_row_norms_from_F(F_c):
+    """Return Euclidean norms of the commutator rows without forming C."""
+    row_sq = np.sum(np.abs(F_c) ** 2, axis=1)
+    col_sq = np.sum(np.abs(F_c) ** 2, axis=0)
+    diag = np.diag(F_c)
+    overlap = (
+        -np.abs(diag)[:, np.newaxis] ** 2
+        -np.abs(diag)[np.newaxis, :] ** 2
+        + np.abs(diag[:, np.newaxis] - diag[np.newaxis, :]) ** 2
+    )
+    norms_sq = row_sq[:, np.newaxis] + col_sq[np.newaxis, :] + overlap
+    norms_sq = np.maximum(norms_sq.real, 0.0)
+    return np.sqrt(norms_sq).ravel()
+
+def interpolative_constraint_from_matrix(C, rank):
+    """Return skeleton row indices from an interpolative decomposition."""
+    C_csr = C.tocsr()
+    row_norms = np.sqrt(np.array(C_csr.multiply(C_csr.conj()).sum(axis=1)).real.ravel())
+    nonzero_idx = np.flatnonzero(row_norms > 0)
+    if nonzero_idx.size < rank:
+        raise ValueError(
+            f"Constraint matrix has only {nonzero_idx.size} nonzero rows, "
+            f"cannot extract rank {rank}."
+        )
+
+    C_nz = C_csr[nonzero_idx, :]
+    C_nz_H = C_nz.conj().transpose().tocsr()
+    A = spla.LinearOperator(
+        shape=C_nz_H.shape,
+        matvec=lambda x: C_nz_H.dot(x),
+        rmatvec=lambda x: C_nz_H.conj().transpose().dot(x),
+        dtype=C_nz_H.dtype,
+    )
+    idx, _ = scipy.linalg.interpolative.interp_decomp(A, rank)
+    return nonzero_idx[np.asarray(idx[:rank], dtype=int)]
+
+def interpolative_constraint_indices(F_c, rank):
+    """Return skeleton commutator-row indices via matrix-free ID."""
+    A = matrix_commutator_from_F_linear_operator(F_c)
+    row_norms = commutator_row_norms_from_F(F_c)
+    nonzero_idx = np.flatnonzero(row_norms > 0)
+    if nonzero_idx.size < rank:
+        raise ValueError(
+            f"Constraint matrix has only {nonzero_idx.size} nonzero rows, "
+            f"cannot extract rank {rank}."
+        )
+
+    n_sq = F_c.shape[0] ** 2
+
+    def _matvec(x):
+        weighted = np.zeros(n_sq, dtype=A.dtype)
+        weighted[nonzero_idx] = x
+        return A.rmatvec(weighted)
+
+    def _rmatvec(y):
+        full = A.matvec(y)
+        return full[nonzero_idx]
+
+    AH = spla.LinearOperator(
+        shape=(n_sq, nonzero_idx.size),
+        matvec=_matvec,
+        rmatvec=_rmatvec,
+        dtype=A.dtype,
+    )
+    idx, _ = scipy.linalg.interpolative.interp_decomp(AH, rank)
+    return nonzero_idx[np.asarray(idx[:rank], dtype=int)]
+
+def interpolative_constraint(F_c, rank):
+    """Return a sparse full-rank commutator constraint matrix from ``F_c``."""
+    selected = interpolative_constraint_indices(F_c, rank)
+    V = selected_commutator_rows(F_c, selected)
+    V_norms = np.sqrt(np.array(V.multiply(V.conj()).sum(axis=1)).real.ravel())
+    return V.multiply((1.0 / np.maximum(V_norms, 1e-30))[:, np.newaxis])

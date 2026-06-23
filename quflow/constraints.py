@@ -25,6 +25,7 @@ call to ``solve`` then uses those factorizations.
 
 import numpy as np
 import scipy.linalg
+import scipy.linalg.interpolative
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
@@ -68,6 +69,72 @@ def commutator_matrix(F):
     left_multiplication = sp.kron(F, identity, format="csr")
     right_multiplication = sp.kron(identity, F.T, format="csr")
     return left_multiplication - right_multiplication
+
+
+def _commutator_linear_operator(F):
+    """Return matrix-free operator for P -> F @ P - P @ F."""
+    N = F.shape[0]
+    n2 = N * N
+
+    def matvec(x):
+        X = x.reshape((N, N))
+        return (F @ X - X @ F).ravel()
+
+    def rmatvec(x):
+        X = x.reshape((N, N))
+        return (F.conj().T @ X - X @ F.conj().T).ravel()
+
+    return spla.LinearOperator(
+        shape=(n2, n2),
+        matvec=matvec,
+        rmatvec=rmatvec,
+        dtype=F.dtype,
+    )
+
+
+def _commutator_row_norms(F):
+    """Return Euclidean norms of rows of the commutator matrix."""
+    row_sq = np.sum(np.abs(F) ** 2, axis=1)
+    col_sq = np.sum(np.abs(F) ** 2, axis=0)
+    diag = np.diag(F)
+    overlap = (
+        -np.abs(diag)[:, np.newaxis] ** 2
+        -np.abs(diag)[np.newaxis, :] ** 2
+        + np.abs(diag[:, np.newaxis] - diag[np.newaxis, :]) ** 2
+    )
+    norms_sq = row_sq[:, np.newaxis] + col_sq[np.newaxis, :] + overlap
+    return np.sqrt(np.maximum(norms_sq.real, 0.0)).ravel()
+
+
+def _selected_commutator_rows(F, selected):
+    """Build selected sparse rows of the commutator matrix."""
+    N = F.shape[0]
+    n2 = N * N
+    selected = np.asarray(selected, dtype=int)
+    rows = []
+    cols = []
+    vals = []
+
+    for row_pos, idx in enumerate(selected):
+        a = idx // N
+        b = idx % N
+
+        row_a = F[a, :]
+        nz_row = np.flatnonzero(np.abs(row_a) > 0)
+        rows.extend([row_pos] * nz_row.size)
+        cols.extend((nz_row * N + b).tolist())
+        vals.extend(row_a[nz_row].tolist())
+
+        col_b = F[:, b]
+        nz_col = np.flatnonzero(np.abs(col_b) > 0)
+        rows.extend([row_pos] * nz_col.size)
+        cols.extend((a * N + nz_col).tolist())
+        vals.extend((-col_b[nz_col]).tolist())
+
+    V = sp.coo_matrix((vals, (rows, cols)), shape=(selected.size, n2)).tocsr()
+    V.sum_duplicates()
+    V.eliminate_zeros()
+    return V
 
 
 def _eigenvalue_multiplicities(eigenvalues, relative_tolerance=1e-10):
@@ -117,7 +184,14 @@ def commutator_rank(F, relative_tolerance=1e-10):
     return int(rank), multiplicities
 
 
-def select_independent_rows_by_qr(C, rank):
+def select_independent_rows_by_qr(
+    C,
+    rank,
+    selection="qr",
+    verbose=False,
+    row_norms=None,
+    get_rows=None,
+):
     """
     Select a sparse, well-scaled row basis for C p = 0.
 
@@ -125,15 +199,29 @@ def select_independent_rows_by_qr(C, rank):
 
     1. Remove zero rows and normalize every remaining row to unit length.
     2. Sort the rows from least dense to most dense.
-    3. Use column-pivoted QR on the transposed row matrix to choose a basis.
+    3. Use column-pivoted QR or interpolative decomposition on the
+       transposed row matrix to choose a basis.
 
     We keep actual rows of C, so the result stays sparse.
     """
-    C = C.tocsr()
+    matrix_free = isinstance(C, spla.LinearOperator)
     if rank == 0:
         return sp.csr_matrix((0, C.shape[1]), dtype=C.dtype)
 
-    row_norms = np.sqrt(np.array(C.multiply(C.conj()).sum(axis=1)).real.ravel())
+    if matrix_free:
+        if selection != "interpolative":
+            raise ValueError("Matrix-free row selection requires 'interpolative'.")
+        if row_norms is None or get_rows is None:
+            raise ValueError(
+                "Matrix-free row selection requires row_norms and get_rows."
+            )
+        row_norms = np.asarray(row_norms)
+    else:
+        C = C.tocsr()
+        row_norms = np.sqrt(
+            np.array(C.multiply(C.conj()).sum(axis=1)).real.ravel()
+        )
+
     nonzero_rows = np.flatnonzero(row_norms > 0)
     if nonzero_rows.size < rank:
         raise ValueError(
@@ -141,19 +229,64 @@ def select_independent_rows_by_qr(C, rank):
             f"but the expected rank is {rank}."
         )
 
-    row_densities = C.getnnz(axis=1)
-    sparsity_order = np.lexsort((nonzero_rows, row_densities[nonzero_rows]))
-    sorted_rows = nonzero_rows[sparsity_order]
+    if matrix_free:
+        sorted_rows = nonzero_rows
+        sorted_norms = row_norms[sorted_rows]
 
-    normalized_rows = C[sorted_rows, :].copy()
-    normalized_rows = normalized_rows.multiply(
-        (1.0 / row_norms[sorted_rows])[:, np.newaxis]
-    ).tocsr()
+        def matvec(x):
+            weighted = np.zeros(C.shape[0], dtype=C.dtype)
+            weighted[sorted_rows] = x / sorted_norms
+            return C.rmatvec(weighted)
 
-    _, _, pivots = scipy.linalg.qr(
-        normalized_rows.toarray().T, pivoting=True, mode="economic"
-    )
-    return normalized_rows[pivots[:rank], :].tocsr()
+        def rmatvec(x):
+            return C.matvec(x)[sorted_rows] / sorted_norms
+
+        transposed_rows = spla.LinearOperator(
+            shape=(C.shape[1], sorted_rows.size),
+            matvec=matvec,
+            rmatvec=rmatvec,
+            dtype=C.dtype,
+        )
+    else:
+        row_densities = C.getnnz(axis=1)
+        sparsity_order = np.lexsort((nonzero_rows, row_densities[nonzero_rows]))
+        sorted_rows = nonzero_rows[sparsity_order]
+
+        normalized_rows = C[sorted_rows, :].copy()
+        normalized_rows = normalized_rows.multiply(
+            (1.0 / row_norms[sorted_rows])[:, np.newaxis]
+        ).tocsr()
+
+    if selection == "qr":
+        _, pivots = scipy.linalg.qr(
+            normalized_rows.toarray().T, pivoting=True, mode="r"
+        )
+    elif selection == "interpolative":
+        if not matrix_free:
+            transposed_rows = normalized_rows.conj().transpose().toarray()
+        pivots, _ = scipy.linalg.interpolative.interp_decomp(
+            transposed_rows, rank, rand=False
+        )
+    else:
+        raise ValueError(
+            f"Unknown row selection '{selection}'. "
+            "Use 'qr' or 'interpolative'."
+        )
+
+    if matrix_free:
+        selected_rows = sorted_rows[np.asarray(pivots[:rank], dtype=int)]
+        V = get_rows(selected_rows)
+        V = V.multiply((1.0 / row_norms[selected_rows])[:, np.newaxis]).tocsr()
+    else:
+        V = normalized_rows[pivots[:rank], :].tocsr()
+    if verbose:
+        density = V.nnz / max(V.shape[0] * V.shape[1], 1)
+        sparsity = 1.0 - density
+        print(
+            f"Selected constraint matrix V: shape={V.shape}, "
+            f"nnz={V.nnz}, density={density:.6e}, sparsity={sparsity:.6e}"
+        )
+    return V
 
 
 def level_set_eigenvects(F, center, num_of_eigenvects, linear=False):
@@ -206,7 +339,7 @@ class BoundaryConditionPoisson:
     4. Form and factor the Schur complement.
     """
 
-    def __init__(self, F_c, N=None):
+    def __init__(self, F_c, N=None, row_selection="qr", verbose=False):
         if N is None:
             N = F_c.shape[0]
         if F_c.shape != (N, N):
@@ -215,8 +348,25 @@ class BoundaryConditionPoisson:
         self.N = N
         self.constraint_rank, self.eigenvalue_group_sizes = commutator_rank(F_c)
 
-        C = commutator_matrix(F_c)
-        self.V = select_independent_rows_by_qr(C, self.constraint_rank)
+        if row_selection == "interpolative_operator":
+            C = _commutator_linear_operator(F_c)
+            selection = "interpolative"
+            row_norms = _commutator_row_norms(F_c)
+            get_rows = lambda rows: _selected_commutator_rows(F_c, rows)
+        else:
+            C = commutator_matrix(F_c)
+            selection = row_selection
+            row_norms = None
+            get_rows = None
+
+        self.V = select_independent_rows_by_qr(
+            C,
+            self.constraint_rank,
+            selection=selection,
+            verbose=verbose,
+            row_norms=row_norms,
+            get_rows=get_rows,
+        )
         self.n_constraints = self.V.shape[0]
 
         self._factor_poisson_matrix()
@@ -356,8 +506,8 @@ class CoastlinePoisson(BoundaryConditionPoisson):
     """
 
     def __init__(self, F_c, N=None, method=None, solver=None, **kwargs):
-        if method is None and solver is None and not kwargs:
-            super().__init__(F_c, N=N)
+        if method is None and solver is None and set(kwargs) <= {"row_selection", "verbose"}:
+            super().__init__(F_c, N=N, **kwargs)
             self._notebook_solver = None
             return
 
