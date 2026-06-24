@@ -203,6 +203,7 @@ def select_independent_rows_by_qr(
     verbose=False,
     row_norms=None,
     row_densities=None,
+    row_norm_tol=1e-12,
     get_rows=None,
 ):
     """
@@ -240,11 +241,16 @@ def select_independent_rows_by_qr(
         )
         row_densities = C.getnnz(axis=1)
 
-    nonzero_rows = np.flatnonzero(row_norms > 0)
+    if row_norm_tol < 0:
+        raise ValueError(f"row_norm_tol must be nonnegative, got {row_norm_tol}.")
+
+    max_row_norm = float(np.max(row_norms)) if row_norms.size else 0.0
+    row_norm_cutoff = row_norm_tol * max_row_norm
+    nonzero_rows = np.flatnonzero(row_norms > row_norm_cutoff)
     if nonzero_rows.size < rank:
         raise ValueError(
-            f"Only {nonzero_rows.size} nonzero constraint rows are available, "
-            f"but the expected rank is {rank}."
+            f"Only {nonzero_rows.size} constraint rows have norm above "
+            f"{row_norm_cutoff:.3e}, but the expected rank is {rank}."
         )
 
     if matrix_free:
@@ -307,12 +313,14 @@ def select_independent_rows_by_qr(
     else:
         V = candidate_rows[pivots[:rank], :].tocsr()
     if verbose:
+        dropped_rows = np.count_nonzero((row_norms > 0) & (row_norms <= row_norm_cutoff))
         density = V.nnz / max(V.shape[0] * V.shape[1], 1)
         sparsity = 1.0 - density
         print(
             f"Selected constraint matrix V: shape={V.shape}, "
             f"nnz={V.nnz}, density={density:.6e}, "
-            f"sparsity={sparsity:.6e}, normalized={normalize_rows}"
+            f"sparsity={sparsity:.6e}, normalized={normalize_rows}, "
+            f"row_norm_tol={row_norm_tol:.1e}, dropped_tiny_rows={dropped_rows}"
         )
     return V
 
@@ -373,6 +381,7 @@ class BoundaryConditionPoisson:
         N=None,
         row_selection="qr",
         normalize_rows=True,
+        row_norm_tol=1e-12,
         verbose=False,
     ):
         if N is None:
@@ -409,6 +418,7 @@ class BoundaryConditionPoisson:
             verbose=verbose,
             row_norms=row_norms,
             row_densities=row_densities,
+            row_norm_tol=row_norm_tol,
             get_rows=get_rows,
         )
         self.n_constraints = self.V.shape[0]
@@ -553,6 +563,7 @@ class CoastlinePoisson(BoundaryConditionPoisson):
         if method is None and solver is None and set(kwargs) <= {
             "row_selection",
             "normalize_rows",
+            "row_norm_tol",
             "verbose",
         }:
             super().__init__(F_c, N=N, **kwargs)
