@@ -290,7 +290,7 @@ def select_independent_rows_by_qr(
         if not matrix_free:
             transposed_rows = candidate_rows.conj().transpose().toarray()
         pivots, _ = scipy.linalg.interpolative.interp_decomp(
-            transposed_rows, rank, rand=matrix_free
+            transposed_rows, rank, rand=False
         )
     else:
         raise ValueError(
