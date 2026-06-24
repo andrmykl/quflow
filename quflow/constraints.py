@@ -188,6 +188,7 @@ def select_independent_rows_by_qr(
     C,
     rank,
     selection="qr",
+    normalize_rows=True,
     verbose=False,
     row_norms=None,
     get_rows=None,
@@ -197,7 +198,8 @@ def select_independent_rows_by_qr(
 
     The steps are:
 
-    1. Remove zero rows and normalize every remaining row to unit length.
+    1. Remove zero rows and optionally normalize every remaining row to unit
+       length.
     2. Sort the rows from least dense to most dense.
     3. Use column-pivoted QR or interpolative decomposition on the
        transposed row matrix to choose a basis.
@@ -231,15 +233,18 @@ def select_independent_rows_by_qr(
 
     if matrix_free:
         sorted_rows = nonzero_rows
-        sorted_norms = row_norms[sorted_rows]
+        if normalize_rows:
+            sorted_scales = row_norms[sorted_rows]
+        else:
+            sorted_scales = np.ones(sorted_rows.size, dtype=row_norms.dtype)
 
         def matvec(x):
             weighted = np.zeros(C.shape[0], dtype=C.dtype)
-            weighted[sorted_rows] = x / sorted_norms
+            weighted[sorted_rows] = x / sorted_scales
             return C.rmatvec(weighted)
 
         def rmatvec(x):
-            return C.matvec(x)[sorted_rows] / sorted_norms
+            return C.matvec(x)[sorted_rows] / sorted_scales
 
         transposed_rows = spla.LinearOperator(
             shape=(C.shape[1], sorted_rows.size),
@@ -252,18 +257,19 @@ def select_independent_rows_by_qr(
         sparsity_order = np.lexsort((nonzero_rows, row_densities[nonzero_rows]))
         sorted_rows = nonzero_rows[sparsity_order]
 
-        normalized_rows = C[sorted_rows, :].copy()
-        normalized_rows = normalized_rows.multiply(
-            (1.0 / row_norms[sorted_rows])[:, np.newaxis]
-        ).tocsr()
+        candidate_rows = C[sorted_rows, :].copy().tocsr()
+        if normalize_rows:
+            candidate_rows = candidate_rows.multiply(
+                (1.0 / row_norms[sorted_rows])[:, np.newaxis]
+            ).tocsr()
 
     if selection == "qr":
         _, pivots = scipy.linalg.qr(
-            normalized_rows.toarray().T, pivoting=True, mode="r"
+            candidate_rows.toarray().T, pivoting=True, mode="r"
         )
     elif selection == "interpolative":
         if not matrix_free:
-            transposed_rows = normalized_rows.conj().transpose().toarray()
+            transposed_rows = candidate_rows.conj().transpose().toarray()
         pivots, _ = scipy.linalg.interpolative.interp_decomp(
             transposed_rows, rank, rand=False
         )
@@ -276,15 +282,18 @@ def select_independent_rows_by_qr(
     if matrix_free:
         selected_rows = sorted_rows[np.asarray(pivots[:rank], dtype=int)]
         V = get_rows(selected_rows)
-        V = V.multiply((1.0 / row_norms[selected_rows])[:, np.newaxis]).tocsr()
+        if normalize_rows:
+            V = V.multiply((1.0 / row_norms[selected_rows])[:, np.newaxis])
+        V = V.tocsr()
     else:
-        V = normalized_rows[pivots[:rank], :].tocsr()
+        V = candidate_rows[pivots[:rank], :].tocsr()
     if verbose:
         density = V.nnz / max(V.shape[0] * V.shape[1], 1)
         sparsity = 1.0 - density
         print(
             f"Selected constraint matrix V: shape={V.shape}, "
-            f"nnz={V.nnz}, density={density:.6e}, sparsity={sparsity:.6e}"
+            f"nnz={V.nnz}, density={density:.6e}, "
+            f"sparsity={sparsity:.6e}, normalized={normalize_rows}"
         )
     return V
 
@@ -339,7 +348,14 @@ class BoundaryConditionPoisson:
     4. Form and factor the Schur complement.
     """
 
-    def __init__(self, F_c, N=None, row_selection="qr", verbose=False):
+    def __init__(
+        self,
+        F_c,
+        N=None,
+        row_selection="qr",
+        normalize_rows=True,
+        verbose=False,
+    ):
         if N is None:
             N = F_c.shape[0]
         if F_c.shape != (N, N):
@@ -363,6 +379,7 @@ class BoundaryConditionPoisson:
             C,
             self.constraint_rank,
             selection=selection,
+            normalize_rows=normalize_rows,
             verbose=verbose,
             row_norms=row_norms,
             get_rows=get_rows,
@@ -506,7 +523,11 @@ class CoastlinePoisson(BoundaryConditionPoisson):
     """
 
     def __init__(self, F_c, N=None, method=None, solver=None, **kwargs):
-        if method is None and solver is None and set(kwargs) <= {"row_selection", "verbose"}:
+        if method is None and solver is None and set(kwargs) <= {
+            "row_selection",
+            "normalize_rows",
+            "verbose",
+        }:
             super().__init__(F_c, N=N, **kwargs)
             self._notebook_solver = None
             return
