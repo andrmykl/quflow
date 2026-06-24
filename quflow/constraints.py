@@ -38,7 +38,6 @@ __all__ = [
     "commutator_matrix",
     "rank_from_eigenvalues",
     "commutator_rank",
-    "real_constraint_rank",
     "complex_matrix_to_real_vector",
     "complex_vector_to_real_vector",
     "linear_operator",
@@ -93,58 +92,6 @@ def _commutator_linear_operator(F):
     )
 
 
-def _complex_vector_to_real_vector(z):
-    """Complex vector z -> stacked [Re(z); Im(z)]."""
-    return np.concatenate([z.real, z.imag])
-
-
-def _real_vector_to_complex_vector(x):
-    """Stacked [Re(z); Im(z)] -> complex vector z."""
-    n = x.shape[0] // 2
-    return x[:n] + 1j * x[n:]
-
-
-def _complex_matrix_to_real_vector(X):
-    """Complex matrix X -> stacked [Re(vec X); Im(vec X)]."""
-    return _complex_vector_to_real_vector(X.ravel())
-
-
-def _real_vector_to_complex_matrix(x, N):
-    """Stacked [Re(vec X); Im(vec X)] -> complex N by N matrix X."""
-    return _real_vector_to_complex_vector(x).reshape((N, N))
-
-
-def _real_constraint_linear_operator(F):
-    """Return real operator X -> ([F, X], X^H + X), both real-stacked."""
-    N = F.shape[0]
-    n2 = N * N
-
-    def matvec(x):
-        X = _real_vector_to_complex_matrix(x, N)
-        commutator = F @ X - X @ F
-        hermitian_part = X.conj().T + X
-        return np.concatenate(
-            [
-                _complex_matrix_to_real_vector(commutator),
-                _complex_matrix_to_real_vector(hermitian_part),
-            ]
-        )
-
-    def rmatvec(y):
-        y_comm = _real_vector_to_complex_matrix(y[: 2 * n2], N)
-        y_herm = _real_vector_to_complex_matrix(y[2 * n2 :], N)
-        commutator_adjoint = F.conj().T @ y_comm - y_comm @ F.conj().T
-        hermitian_adjoint = y_herm + y_herm.conj().T
-        return _complex_matrix_to_real_vector(commutator_adjoint + hermitian_adjoint)
-
-    return spla.LinearOperator(
-        shape=(4 * n2, 2 * n2),
-        matvec=matvec,
-        rmatvec=rmatvec,
-        dtype=float,
-    )
-
-
 def _commutator_row_norms(F):
     """Return Euclidean norms of rows of the commutator matrix."""
     row_sq = np.sum(np.abs(F) ** 2, axis=1)
@@ -168,42 +115,6 @@ def _commutator_row_densities(F):
     duplicate = diag_support[:, np.newaxis] & diag_support[np.newaxis, :]
     densities = row_counts[:, np.newaxis] + col_counts[np.newaxis, :] - duplicate
     return (2 * densities.astype(int)).ravel()
-
-
-def _real_constraint_row_norms(F):
-    """Return row norms of X -> ([F, X], X^H + X) in real coordinates."""
-    N = F.shape[0]
-    commutator_norms = _commutator_row_norms(F)
-    hermitian_real_norms = np.full((N, N), np.sqrt(2.0))
-    np.fill_diagonal(hermitian_real_norms, 2.0)
-    hermitian_imag_norms = np.full((N, N), np.sqrt(2.0))
-    np.fill_diagonal(hermitian_imag_norms, 0.0)
-    return np.concatenate(
-        [
-            commutator_norms,
-            commutator_norms,
-            hermitian_real_norms.ravel(),
-            hermitian_imag_norms.ravel(),
-        ]
-    )
-
-
-def _real_constraint_row_densities(F):
-    """Return approximate row densities of the real stacked constraint."""
-    N = F.shape[0]
-    commutator_densities = _commutator_row_densities(F)
-    hermitian_real_densities = np.full((N, N), 2)
-    np.fill_diagonal(hermitian_real_densities, 1)
-    hermitian_imag_densities = np.full((N, N), 2)
-    np.fill_diagonal(hermitian_imag_densities, 0)
-    return np.concatenate(
-        [
-            commutator_densities,
-            commutator_densities,
-            hermitian_real_densities.ravel(),
-            hermitian_imag_densities.ravel(),
-        ]
-    )
 
 
 def _selected_commutator_rows(F, selected):
@@ -232,30 +143,6 @@ def _selected_commutator_rows(F, selected):
         vals.extend((-col_b[nz_col]).tolist())
 
     V = sp.coo_matrix((vals, (rows, cols)), shape=(selected.size, n2)).tocsr()
-    V.sum_duplicates()
-    V.eliminate_zeros()
-    return V
-
-
-def _selected_linear_operator_rows(operator, selected):
-    """Build selected rows of a real LinearOperator by applying its adjoint."""
-    selected = np.asarray(selected, dtype=int)
-    rows = []
-    cols = []
-    vals = []
-
-    for row_pos, idx in enumerate(selected):
-        basis_row = np.zeros(operator.shape[0], dtype=operator.dtype)
-        basis_row[idx] = 1.0
-        row = np.asarray(operator.rmatvec(basis_row)).ravel()
-        nonzero_cols = np.flatnonzero(np.abs(row) > 0)
-        rows.extend([row_pos] * nonzero_cols.size)
-        cols.extend(nonzero_cols.tolist())
-        vals.extend(row[nonzero_cols].tolist())
-
-    V = sp.coo_matrix(
-        (vals, (rows, cols)), shape=(selected.size, operator.shape[1])
-    ).tocsr()
     V.sum_duplicates()
     V.eliminate_zeros()
     return V
@@ -305,22 +192,6 @@ def commutator_rank(F, relative_tolerance=1e-10):
         eigenvalues, relative_tolerance=relative_tolerance
     )
     rank = N**2 - sum(size**2 for size in multiplicities)
-    return int(rank), multiplicities
-
-
-def real_constraint_rank(F, relative_tolerance=1e-10):
-    """
-    Return the real rank of X -> ([F, X], X^H + X).
-
-    The nullspace consists of skew-Hermitian matrices that commute with F.
-    If the eigenvalue multiplicities of F are m_i, that nullspace has real
-    dimension sum_i m_i**2 inside the 2*N**2-dimensional real matrix space.
-    """
-    N = F.shape[0]
-    _, multiplicities = commutator_rank(
-        F, relative_tolerance=relative_tolerance
-    )
-    rank = 2 * N**2 - sum(size**2 for size in multiplicities)
     return int(rank), multiplicities
 
 
@@ -419,7 +290,7 @@ def select_independent_rows_by_qr(
         if not matrix_free:
             transposed_rows = candidate_rows.conj().transpose().toarray()
         pivots, _ = scipy.linalg.interpolative.interp_decomp(
-            transposed_rows, rank, rand=False
+            transposed_rows, rank, rand=matrix_free
         )
     else:
         raise ValueError(
@@ -510,30 +381,25 @@ class BoundaryConditionPoisson:
             raise ValueError(f"F_c must have shape {(N, N)}, got {F_c.shape}.")
 
         self.N = N
-        self.real_constraints = row_selection == "real_interpolative_operator"
-        if self.real_constraints:
-            self.constraint_rank, self.eigenvalue_group_sizes = real_constraint_rank(F_c)
-        else:
-            self.constraint_rank, self.eigenvalue_group_sizes = commutator_rank(F_c)
+        self.constraint_rank, self.eigenvalue_group_sizes = commutator_rank(F_c)
 
-        if row_selection == "real_interpolative_operator":
-            C = _real_constraint_linear_operator(F_c)
-            selection = "interpolative"
-            row_norms = _real_constraint_row_norms(F_c)
-            row_densities = _real_constraint_row_densities(F_c)
-            get_rows = lambda rows: _selected_linear_operator_rows(C, rows)
-        elif row_selection == "interpolative_operator":
+        if row_selection == "interpolative_operator":
             C = _commutator_linear_operator(F_c)
             selection = "interpolative"
             row_norms = _commutator_row_norms(F_c)
             row_densities = _commutator_row_densities(F_c)
             get_rows = lambda rows: _selected_commutator_rows(F_c, rows)
-        else:
+        elif row_selection in {"qr", "interpolative"}:
             C = commutator_matrix(F_c)
             selection = row_selection
             row_norms = None
             row_densities = None
             get_rows = None
+        else:
+            raise ValueError(
+                f"Unknown row selection '{row_selection}'. "
+                "Use 'qr', 'interpolative', or 'interpolative_operator'."
+            )
 
         self.V = select_independent_rows_by_qr(
             C,
@@ -573,34 +439,12 @@ class BoundaryConditionPoisson:
             self._schur_lu = None
             return
 
-        if self.real_constraints:
-            self._factor_real_schur_complement()
-            return
-
         V_H = self.V.conj().T.tocsc()
         negative_schur = np.empty((m, m), dtype=complex)
 
         for j in range(m):
             right_hand_side = V_H[:, j].toarray().ravel()
             A_inverse_column = self._A_lu.solve(right_hand_side)
-            negative_schur[:, j] = -(self.V @ A_inverse_column)
-
-        self._schur_lu = scipy.linalg.lu_factor(negative_schur)
-
-    def _solve_real_poisson_vector(self, x):
-        """Apply A^{-1} to a real-stacked complex vector."""
-        solved = self._A_lu.solve(_real_vector_to_complex_vector(x))
-        return _complex_vector_to_real_vector(solved)
-
-    def _factor_real_schur_complement(self):
-        """Form and factor -V A_real^{-1} V^T for real constraints."""
-        m = self.n_constraints
-        V_T = self.V.T.tocsc()
-        negative_schur = np.empty((m, m), dtype=float)
-
-        for j in range(m):
-            right_hand_side = V_T[:, j].toarray().ravel()
-            A_inverse_column = self._solve_real_poisson_vector(right_hand_side)
             negative_schur[:, j] = -(self.V @ A_inverse_column)
 
         self._schur_lu = scipy.linalg.lu_factor(negative_schur)
@@ -628,9 +472,6 @@ class BoundaryConditionPoisson:
 
     def _solve_one(self, W):
         """Solve one constrained Poisson problem."""
-        if self.real_constraints:
-            return self._solve_one_real_constraints(W)
-
         w = W.ravel()
         p_without_constraints = self._A_lu.solve(w)
 
@@ -649,34 +490,12 @@ class BoundaryConditionPoisson:
         P -= np.trace(P) / self.N * np.eye(self.N, dtype=P.dtype)
         return P
 
-    def _solve_one_real_constraints(self, W):
-        """Solve one constrained Poisson problem with real-stacked constraints."""
-        w = _complex_matrix_to_real_vector(W)
-        p_without_constraints = self._solve_real_poisson_vector(w)
-
-        if self.n_constraints:
-            schur_right_hand_side = self.V @ p_without_constraints
-            lambda_vector = scipy.linalg.lu_solve(
-                self._schur_lu, -schur_right_hand_side
-            )
-
-            correction = self.V.T @ lambda_vector
-            p = self._solve_real_poisson_vector(w - correction)
-        else:
-            p = p_without_constraints
-
-        P = _real_vector_to_complex_matrix(p, self.N)
-        P -= np.trace(P) / self.N * np.eye(self.N, dtype=P.dtype)
-        return P
-
     def solve_poisson(self, W):
         """Alias with the same meaning as ``solve``."""
         return self.solve(W)
 
     def boundary_residual(self, P):
         """Return || V @ P.ravel() ||, useful for checking a solution."""
-        if self.real_constraints:
-            return float(np.linalg.norm(self.V @ _complex_matrix_to_real_vector(P)))
         return float(np.linalg.norm(self.V @ np.asarray(P).ravel()))
 
 
