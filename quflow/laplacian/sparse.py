@@ -144,7 +144,7 @@ def laplacian(N, bc=False):
     global _sparse_laplacian_cache
 
     if (N, bc) not in _sparse_laplacian_cache:
-        A = compute_sparse_laplacian(N)
+        A = compute_sparse_laplacian(N, bc=bc)
         _sparse_laplacian_cache[(N, bc)] = A
 
     return _sparse_laplacian_cache[(N, bc)]

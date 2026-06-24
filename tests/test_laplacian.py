@@ -105,6 +105,16 @@ def get_smooth_mat(N=5):
     return qf.shr2mat(omegar, N=N)
 
 
+def test_sparse_laplacian_respects_bc_flag():
+    N = 5
+    A = qusparse.laplacian(N, bc=False).toarray()
+    A_bc = qusparse.laplacian(N, bc=True).toarray()
+
+    assert np.count_nonzero(A_bc - A) > 0
+    assert np.linalg.matrix_rank(A) == N**2 - 1
+    assert np.linalg.matrix_rank(A_bc) == N**2
+
+
 @pytest.mark.parametrize("N", [2, 33, 65, 128])
 @pytest.mark.parametrize("qulap", [qudirect, qucpu, qugpu, qusparse, qutridiagonal])
 @pytest.mark.parametrize("skewh", [True, False])
