@@ -35,6 +35,8 @@ import quflow as qf
 __all__ = [
     "BoundaryConditionPoisson",
     "CoastlinePoisson",
+    "CommutatorKernelProjection",
+    "NonzeroEigenprojectorComplementProjection",
     "commutator_matrix",
     "rank_from_eigenvalues",
     "commutator_rank",
@@ -53,6 +55,9 @@ __all__ = [
     "scipy",
     "level_set_eigenvects",
     "island_mask",
+    "project_to_eigenprojector_complement",
+    "project_to_commutator_kernel",
+    "project_to_trace_free_level_set",
 ]
 
 
@@ -176,6 +181,145 @@ def _eigenvalue_multiplicities(eigenvalues, relative_tolerance=1e-10):
     return counts
 
 
+def _eigenvalue_group_ids(eigenvalues, relative_tolerance=1e-10):
+    """Return consecutive group ids for sorted, nearly equal eigenvalues."""
+    eigenvalues = np.asarray(eigenvalues, dtype=float)
+    if eigenvalues.size == 0:
+        return np.empty(0, dtype=int), []
+
+    scale = max(1.0, float(np.max(np.abs(eigenvalues))))
+    tolerance = relative_tolerance * scale
+
+    group_ids = np.zeros(eigenvalues.size, dtype=int)
+    group_sizes = []
+    group_start = eigenvalues[0]
+    group_size = 1
+    group_id = 0
+    for index, value in enumerate(eigenvalues[1:], start=1):
+        if abs(value - group_start) <= tolerance:
+            group_size += 1
+        else:
+            group_sizes.append(group_size)
+            group_id += 1
+            group_start = value
+            group_size = 1
+        group_ids[index] = group_id
+
+    group_sizes.append(group_size)
+    return group_ids, group_sizes
+
+
+def _level_set_keep_mask(eigenvalues, center, num_of_eigenvects):
+    """Return selected eigenvalue mask and count for ``level_set_eigenvects``."""
+    if np.ndim(num_of_eigenvects) == 0:
+        K = int(num_of_eigenvects)
+        if K < 0 or K > eigenvalues.size:
+            raise ValueError(
+                f"num_of_eigenvects must be between 0 and {eigenvalues.size}, "
+                f"got {K}."
+            )
+
+        keep = np.zeros(eigenvalues.shape, dtype=bool)
+        closest = np.argsort(np.abs(eigenvalues - center), kind="stable")[:K]
+        keep[closest] = True
+        return keep, K
+
+    selector = np.asarray(num_of_eigenvects, dtype=float)
+    if selector.shape != (2,):
+        raise ValueError(
+            "num_of_eigenvects must be an integer or a two-entry selector "
+            "like [-2, 3], [-1, np.inf], or [-np.inf, 1]."
+        )
+
+    first_selector, second_selector = selector
+
+    below_indices = np.flatnonzero(eigenvalues < center)
+    above_indices = np.flatnonzero(eigenvalues > center)
+
+    def closest_indices(indices, side):
+        if side == "below":
+            distances = center - eigenvalues[indices]
+        else:
+            distances = eigenvalues[indices] - center
+        return indices[np.argsort(distances, kind="stable")]
+
+    def integer_count(value, side):
+        count = int(abs(value))
+        if count != abs(value):
+            raise ValueError(f"The {side}-center selector must be an integer count.")
+        return count
+
+    def select_first_ranks(indices, value, side):
+        if np.isinf(value):
+            return indices
+
+        count = integer_count(value, side)
+        if count > indices.size:
+            raise ValueError(
+                f"Requested {count} eigenvalues {side} center, but only "
+                f"{indices.size} are available."
+            )
+        return closest_indices(indices, side)[:count]
+
+    def select_rank_range(indices, first, second, side):
+        ranks = []
+        for value in (first, second):
+            if np.isinf(value):
+                ranks.append(indices.size)
+            else:
+                rank = integer_count(value, side)
+                if rank < 1:
+                    raise ValueError(
+                        f"Same-side {side}-center selectors must use positive ranks."
+                    )
+                ranks.append(rank)
+
+        start_rank = min(ranks)
+        stop_rank = max(ranks)
+        if stop_rank > indices.size:
+            raise ValueError(
+                f"Requested the {stop_rank}th eigenvalue {side} center, but only "
+                f"{indices.size} are available."
+            )
+        return closest_indices(indices, side)[start_rank - 1 : stop_rank]
+
+    first_is_below = first_selector < 0 or np.isneginf(first_selector)
+    second_is_below = second_selector < 0 or np.isneginf(second_selector)
+    first_is_above = first_selector > 0 or np.isposinf(first_selector)
+    second_is_above = second_selector > 0 or np.isposinf(second_selector)
+
+    if first_is_below and second_is_below:
+        selected_below = select_rank_range(
+            below_indices, first_selector, second_selector, "below"
+        )
+        selected_above = np.empty(0, dtype=int)
+    elif first_is_above and second_is_above:
+        selected_below = np.empty(0, dtype=int)
+        selected_above = select_rank_range(
+            above_indices, first_selector, second_selector, "above"
+        )
+    else:
+        below_selector, above_selector = first_selector, second_selector
+        if not (below_selector <= 0 or np.isneginf(below_selector)):
+            raise ValueError(
+                "The first selector entry must be nonpositive; for example -2 "
+                "selects the two closest eigenvalues below center."
+            )
+        if not (above_selector >= 0 or np.isposinf(above_selector)):
+            raise ValueError(
+                "The second selector entry must be nonnegative; for example 3 "
+                "selects the three closest eigenvalues above center."
+            )
+
+        selected_below = select_first_ranks(below_indices, below_selector, "below")
+        selected_above = select_first_ranks(above_indices, above_selector, "above")
+
+    keep = np.zeros(eigenvalues.shape, dtype=bool)
+    keep[selected_below] = True
+    keep[selected_above] = True
+    return keep, int(np.count_nonzero(keep))
+
+
 def commutator_rank(F, relative_tolerance=1e-10):
     """
     Return the rank of the map P -> [F, P].
@@ -193,6 +337,282 @@ def commutator_rank(F, relative_tolerance=1e-10):
     )
     rank = N**2 - sum(size**2 for size in multiplicities)
     return int(rank), multiplicities
+
+
+class CommutatorKernelProjection:
+    """
+    Orthogonal projection onto ``ker(P -> [F_c, P])``.
+
+    The code assumes the same convention as the constrained Poisson solver:
+    ``F_c`` is skew-Hermitian.  If
+
+        F_c = U diag(i alpha) U^H,
+
+    then a matrix commutes with ``F_c`` exactly when ``U^H P U`` is block
+    diagonal with respect to equal values of ``alpha``.  The projector keeps
+    those blocks and zeros the off-block entries.  This is the Frobenius /
+    Hilbert-Schmidt orthogonal projection onto the constraint space.
+    """
+
+    def __init__(
+        self,
+        F_c,
+        N=None,
+        relative_tolerance=1e-10,
+        check_skew_hermitian=True,
+    ):
+        F_c = np.asarray(F_c)
+        if N is None:
+            N = F_c.shape[0]
+        if F_c.shape != (N, N):
+            raise ValueError(f"F_c must have shape {(N, N)}, got {F_c.shape}.")
+        if relative_tolerance < 0:
+            raise ValueError(
+                f"relative_tolerance must be nonnegative, got {relative_tolerance}."
+            )
+
+        H = -1j * F_c
+        if check_skew_hermitian:
+            scale = max(1.0, float(np.linalg.norm(H, ord=np.inf)))
+            if not np.allclose(
+                H,
+                H.conj().T,
+                rtol=relative_tolerance,
+                atol=relative_tolerance * scale,
+            ):
+                raise ValueError(
+                    "F_c must be skew-Hermitian so that -1j * F_c is Hermitian."
+                )
+            H = 0.5 * (H + H.conj().T)
+
+        eigenvalues, eigenvectors = np.linalg.eigh(H)
+        group_ids, group_sizes = _eigenvalue_group_ids(
+            eigenvalues, relative_tolerance=relative_tolerance
+        )
+
+        self.N = N
+        self.dtype = np.result_type(F_c.dtype, np.complex128)
+        self.relative_tolerance = relative_tolerance
+        self.eigenvalues = eigenvalues
+        self.eigenvectors = eigenvectors
+        self.eigenvalue_group_ids = group_ids
+        self.eigenvalue_group_sizes = group_sizes
+        self.block_mask = group_ids[:, np.newaxis] == group_ids[np.newaxis, :]
+        self.rank = N**2 - sum(size**2 for size in group_sizes)
+        self.kernel_dimension = sum(size**2 for size in group_sizes)
+
+    def project(self, X):
+        """
+        Project one matrix or a batch of matrices onto ``ker [F_c, .]``.
+
+        ``X`` may have shape ``(N, N)`` or any batch shape ending in
+        ``(N, N)``.  The returned array has the same shape.
+        """
+        X = np.asarray(X)
+        if X.shape[-2:] != (self.N, self.N):
+            raise ValueError(
+                f"X must end with shape {(self.N, self.N)}, got {X.shape}."
+            )
+
+        U = self.eigenvectors
+        U_H = U.conj().T
+        X_eigenbasis = U_H @ X @ U
+        X_eigenbasis = X_eigenbasis * self.block_mask
+        return U @ X_eigenbasis @ U_H
+
+    def __call__(self, X):
+        return self.project(X)
+
+    def commutator_residual(self, X):
+        """Return ``||[F_c, X]||_F`` for one matrix or each matrix in a batch."""
+        X = np.asarray(X)
+        if X.shape[-2:] != (self.N, self.N):
+            raise ValueError(
+                f"X must end with shape {(self.N, self.N)}, got {X.shape}."
+            )
+        X_eigenbasis = self.eigenvectors.conj().T @ X @ self.eigenvectors
+        eigenvalue_differences = (
+            self.eigenvalues[:, np.newaxis] - self.eigenvalues[np.newaxis, :]
+        )
+        residual = 1j * eigenvalue_differences * X_eigenbasis
+        if residual.ndim == 2:
+            return float(np.linalg.norm(residual))
+        return np.linalg.norm(residual, axis=(-2, -1))
+
+    def aslinearoperator(self):
+        """Return a matrix-free vectorized SciPy ``LinearOperator``."""
+        n2 = self.N * self.N
+
+        def matvec(x):
+            return self.project(np.asarray(x).reshape((self.N, self.N))).ravel()
+
+        return spla.LinearOperator(
+            shape=(n2, n2),
+            matvec=matvec,
+            rmatvec=matvec,
+            dtype=self.dtype,
+        )
+
+
+def project_to_commutator_kernel(
+    X,
+    F_c,
+    N=None,
+    relative_tolerance=1e-10,
+    check_skew_hermitian=True,
+):
+    """Project ``X`` onto the constraint space ``ker(P -> [F_c, P])``."""
+    projector = CommutatorKernelProjection(
+        F_c,
+        N=N,
+        relative_tolerance=relative_tolerance,
+        check_skew_hermitian=check_skew_hermitian,
+    )
+    return projector.project(X)
+
+
+class NonzeroEigenprojectorComplementProjection:
+    """
+    Orthogonal projection away from nonzero-eigenvector projectors of ``F_c``.
+
+    If ``e_1, ..., e_k`` are the eigenvectors of the skew-Hermitian matrix
+    ``F_c`` with nonzero eigenvalues, this projector maps a matrix ``X`` to the
+    closest matrix satisfying
+
+        <e_i e_i^H, X> = e_i^H X e_i = 0,  i = 1, ..., k,
+
+    where ``<A, B> = tr(A^H B)`` is the Frobenius inner product.
+    """
+
+    def __init__(
+        self,
+        F_c,
+        N=None,
+        relative_tolerance=1e-10,
+        nonzero_tolerance=None,
+        check_skew_hermitian=True,
+    ):
+        F_c = np.asarray(F_c)
+        if N is None:
+            N = F_c.shape[0]
+        if F_c.shape != (N, N):
+            raise ValueError(f"F_c must have shape {(N, N)}, got {F_c.shape}.")
+        if relative_tolerance < 0:
+            raise ValueError(
+                f"relative_tolerance must be nonnegative, got {relative_tolerance}."
+            )
+
+        H = -1j * F_c
+        if check_skew_hermitian:
+            scale = max(1.0, float(np.linalg.norm(H, ord=np.inf)))
+            if not np.allclose(
+                H,
+                H.conj().T,
+                rtol=relative_tolerance,
+                atol=relative_tolerance * scale,
+            ):
+                raise ValueError(
+                    "F_c must be skew-Hermitian so that -1j * F_c is Hermitian."
+                )
+            H = 0.5 * (H + H.conj().T)
+
+        eigenvalues, eigenvectors = np.linalg.eigh(H)
+        eigenvalue_scale = max(1.0, float(np.max(np.abs(eigenvalues))))
+        if nonzero_tolerance is None:
+            nonzero_tolerance = relative_tolerance * eigenvalue_scale
+        if nonzero_tolerance < 0:
+            raise ValueError(
+                f"nonzero_tolerance must be nonnegative, got {nonzero_tolerance}."
+            )
+
+        self.N = N
+        self.dtype = np.result_type(F_c.dtype, np.complex128)
+        self.relative_tolerance = relative_tolerance
+        self.nonzero_tolerance = nonzero_tolerance
+        self.eigenvalues = eigenvalues
+        self.eigenvectors = eigenvectors
+        self.projector_indices = np.flatnonzero(
+            np.abs(eigenvalues) > nonzero_tolerance
+        )
+        self.num_projectors = int(self.projector_indices.size)
+        self.kernel_dimension = N**2 - self.num_projectors
+
+    def project(self, X):
+        """
+        Project one matrix or a batch of matrices.
+
+        ``X`` may have shape ``(N, N)`` or any batch shape ending in
+        ``(N, N)``.  The returned array has the same shape.
+        """
+        X = np.asarray(X)
+        if X.shape[-2:] != (self.N, self.N):
+            raise ValueError(
+                f"X must end with shape {(self.N, self.N)}, got {X.shape}."
+            )
+
+        U = self.eigenvectors
+        U_H = U.conj().T
+        X_eigenbasis = U_H @ X @ U
+        if self.num_projectors:
+            X_eigenbasis = X_eigenbasis.copy()
+            idx = self.projector_indices
+            X_eigenbasis[..., idx, idx] = 0.0
+        return U @ X_eigenbasis @ U_H
+
+    def __call__(self, X):
+        return self.project(X)
+
+    def component_values(self, X):
+        """Return the removed values ``e_i^H X e_i``."""
+        X = np.asarray(X)
+        if X.shape[-2:] != (self.N, self.N):
+            raise ValueError(
+                f"X must end with shape {(self.N, self.N)}, got {X.shape}."
+            )
+        X_eigenbasis = self.eigenvectors.conj().T @ X @ self.eigenvectors
+        return X_eigenbasis[..., self.projector_indices, self.projector_indices]
+
+    def component_residual(self, X):
+        """Return the Euclidean norm of the nonzero-eigenprojector components."""
+        values = self.component_values(X)
+        if values.ndim == 1:
+            return float(np.linalg.norm(values))
+        return np.linalg.norm(values, axis=-1)
+
+    def aslinearoperator(self):
+        """Return a matrix-free vectorized SciPy ``LinearOperator``."""
+        n2 = self.N * self.N
+
+        def matvec(x):
+            return self.project(np.asarray(x).reshape((self.N, self.N))).ravel()
+
+        return spla.LinearOperator(
+            shape=(n2, n2),
+            matvec=matvec,
+            rmatvec=matvec,
+            dtype=self.dtype,
+        )
+
+
+def project_to_eigenprojector_complement(
+    X,
+    F_c,
+    N=None,
+    relative_tolerance=1e-10,
+    nonzero_tolerance=None,
+    check_skew_hermitian=True,
+):
+    """
+    Project ``X`` so its ``e_i e_i^H`` components vanish for nonzero modes.
+    """
+    projector = NonzeroEigenprojectorComplementProjection(
+        F_c,
+        N=N,
+        relative_tolerance=relative_tolerance,
+        nonzero_tolerance=nonzero_tolerance,
+        check_skew_hermitian=check_skew_hermitian,
+    )
+    return projector.project(X)
 
 
 def select_independent_rows_by_qr(
@@ -325,13 +745,44 @@ def select_independent_rows_by_qr(
     return V
 
 
-def level_set_eigenvects(F, center, num_of_eigenvects, linear=False):
+def level_set_eigenvects(
+    F,
+    center,
+    num_of_eigenvects,
+    linear=False,
+    uniform_eigenvalue=None,
+):
     """
-    Keep the eigenvectors of F whose eigenvalues are closest to one level.
+    Keep selected eigenvectors of F around one level.
 
     Since F is skew-Hermitian, -1j*F is Hermitian with real eigenvalues.  We
-    keep the ``num_of_eigenvects`` eigenvalues closest to ``center`` and set
-    all other eigenvalues to zero.
+    select eigenvectors from those real eigenvalues and set all other
+    eigenvalues to zero.
+
+    ``num_of_eigenvects`` can be either:
+
+    - an integer K: keep the K eigenvalues closest to ``center``.  This is
+      the original behavior.
+    - a mixed-sign two-entry selector ``[-a, b]``: keep the ``a`` closest
+      eigenvalues strictly below ``center`` and the ``b`` closest eigenvalues
+      strictly above ``center``.  For example, ``[-2, 3]`` keeps two below and
+      three above.
+    - a same-side two-entry selector: keep an inclusive range of closeness
+      ranks on that side.  For example, ``[-5, -2]`` keeps the fifth through
+      second closest eigenvalues below ``center``; ``[2, 5]`` keeps the second
+      through fifth closest eigenvalues above ``center``.
+
+    Either side can be infinite.  ``[-1, np.inf]`` keeps the closest
+    eigenvalue below ``center`` and all eigenvalues above it; ``[-np.inf, 1]``
+    keeps all eigenvalues below and the closest one above.  In same-side
+    ranges, infinity opens the range to all available ranks on that side, e.g.
+    ``[2, np.inf]`` keeps the second closest and all farther eigenvalues above
+    ``center``.
+
+    If ``uniform_eigenvalue`` is not ``None``, every retained eigenvalue of
+    the returned ``F_c`` is set to ``1j * uniform_eigenvalue``.  For example,
+    ``uniform_eigenvalue=5`` sets the retained eigenvalues to ``5j``.  This
+    option cannot be combined with ``linear=True``.
 
     Returns
     -------
@@ -340,27 +791,62 @@ def level_set_eigenvects(F, center, num_of_eigenvects, linear=False):
     K : int
         The number of kept eigenvectors.
     """
+    if uniform_eigenvalue is not None and linear:
+        raise ValueError("uniform_eigenvalue cannot be combined with linear=True.")
+
     eigenvalues, eigenvectors = np.linalg.eigh(-1j * F)
-    K = int(num_of_eigenvects)
-    if K < 0 or K > eigenvalues.size:
-        raise ValueError(
-            f"num_of_eigenvects must be between 0 and {eigenvalues.size}, got {K}."
-        )
+    keep, K = _level_set_keep_mask(eigenvalues, center, num_of_eigenvects)
 
-    keep = np.zeros(eigenvalues.shape, dtype=bool)
-    closest = np.argsort(np.abs(eigenvalues - center), kind="stable")[:K]
-    keep[closest] = True
-
-    kept_eigenvalues = np.zeros_like(eigenvalues)
-    if linear:
-        kept_eigenvalues[keep] = np.arange(1, K + 1)
+    output_eigenvalues = np.zeros(eigenvalues.shape, dtype=complex)
+    if uniform_eigenvalue is not None:
+        output_eigenvalues[keep] = 1j * uniform_eigenvalue
+    elif linear:
+        output_eigenvalues[keep] = 1j * np.arange(1, K + 1)
     else:
-        kept_eigenvalues[keep] = eigenvalues[keep]
+        output_eigenvalues[keep] = 1j * eigenvalues[keep]
 
-    F_c = (eigenvectors * (1j * kept_eigenvalues)[np.newaxis, :]) @ (
+    F_c = (eigenvectors * output_eigenvalues[np.newaxis, :]) @ (
         eigenvectors.conj().T
     )
     return F_c, K
+
+
+def project_to_trace_free_level_set(W, F, center, num_of_eigenvects):
+    """
+    Project ``W`` onto a selected level-set subspace and remove its trace.
+
+    This builds
+
+        F_0, K = level_set_eigenvects(
+            F, center, num_of_eigenvects, uniform_eigenvalue=1
+        )
+
+    so that ``F_0 = 1j * P`` on the retained subspace.  It then applies
+    ``P W P`` using the equivalent ``F_0`` formula and subtracts the trace on
+    the retained subspace:
+
+        P W P - tr(P W P) / K * P.
+
+    ``W`` may be one matrix or a batch whose last two axes are matrix axes.
+    """
+    W = np.asarray(W)
+    if W.shape[-2:] != F.shape[-2:]:
+        raise ValueError(f"W must end with shape {F.shape[-2:]}, got {W.shape}.")
+
+    F_0, K = level_set_eigenvects(
+        F, center, num_of_eigenvects, uniform_eigenvalue=1
+    )
+    projected = F_0 @ (F_0.conj().T @ W @ F_0) @ F_0.conj().T
+    if K == 0:
+        return projected
+
+    subspace_projector = F_0 @ F_0.conj().T
+    trace = np.trace(projected, axis1=-2, axis2=-1)
+    projected = (
+        projected
+        - (trace / K)[..., np.newaxis, np.newaxis] * subspace_projector
+    )
+    return projected
 
 
 class BoundaryConditionPoisson:
