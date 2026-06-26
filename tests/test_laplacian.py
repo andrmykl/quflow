@@ -8,6 +8,29 @@ import quflow.laplacian.cpu as qucpu
 import quflow.laplacian.gpu as qugpu
 from scipy.sparse import dia_matrix
 
+try:
+    import cupy as cp
+except ImportError:
+    cuda_available = False
+else:
+    cuda_available = True if cp.is_available() else False
+
+qucuda = None
+if cuda_available:
+    from quflow.experimental.cuda import DiagTriDiagOp
+    class CudaPoissonWrapper(object):
+
+        __name__ = "qucuda"
+
+        def solve_poisson(self, W):
+            N = W.shape[-1]
+            ham = DiagTriDiagOp(N, dtype=np.dtype(W.dtype))
+            Wd = cp.asarray(W)
+            Pd = cp.zeros_like(Wd)
+            ham(Pd, Wd)
+            return Pd.get()
+
+    qucuda = CudaPoissonWrapper()
 
 def get_random_omega_real(N=5):
     return np.random.randn(N**2)
@@ -22,9 +45,11 @@ def get_random_mat(N=5, zero_trace=True, skewh=True):
     return W
 
 
-def get_random_poisson_solution(N=5, skewh=True, seed=None, lmax=16):
+def get_random_poisson_solution(N=5, skewh=True, seed=None, lmax=None, zerotrace=True):
     if seed is not None:
         np.random.seed(seed)  # For reproducability
+    if lmax is None:
+        lmax = N
     lmax = min(lmax, N)
     if skewh:
         omegaP = np.random.randn(lmax**2)
@@ -33,7 +58,8 @@ def get_random_poisson_solution(N=5, skewh=True, seed=None, lmax=16):
     omegaW = omegaP.copy()
     ells = qf.ind2elm(np.arange(lmax**2))[0][1:]
     omegaW[1:] *= -ells*(ells+1)
-    omegaW[0] = 0.0
+    if zerotrace:
+        omegaW[0] = 0.0
     omegaP[0] = 0.0
 
     if skewh:
@@ -208,24 +234,32 @@ def test_solve_poisson_multistate(N):
 
 
 @pytest.mark.parametrize("N", [33, 64, 101])
-@pytest.mark.parametrize("qulap", [qudirect, qucpu, qugpu, qusparse, qutridiagonal])
 @pytest.mark.parametrize("skewh", [True, False])
-def test_solve_poisson(N, qulap, skewh):
+@pytest.mark.parametrize("zerotrace", [True, False])
+@pytest.mark.parametrize("qulap", [qudirect, qucpu, qucuda, qugpu, qusparse, qutridiagonal])
+def test_solve_poisson(N, qulap, skewh, zerotrace):
 
-    Pexact, Wexact = get_random_poisson_solution(N=N, skewh=skewh, seed=None)
+    if qulap is None:
+        return None
+
+    Pexact, Wexact = get_random_poisson_solution(N=N, skewh=skewh, seed=None, zerotrace=zerotrace)
 
     try:
         oldflag = qulap.select_skewherm(skewh)
     except AttributeError:
         if not skewh:
             return None
+    
+    if not zerotrace and qulap is qugpu: # Skipping this situation for gugpu which is anyway obsolete
+        return None
+
     P = qulap.solve_poisson(Wexact)
     try:
         qulap.select_skewherm(oldflag)
     except AttributeError:
         pass
 
-    np.testing.assert_allclose(P, Pexact)
+    np.testing.assert_allclose(P, Pexact, atol=1e-14*N**2, rtol=0)
 
 
 @pytest.mark.parametrize("N", [33, 65, 128])

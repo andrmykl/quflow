@@ -53,17 +53,14 @@ def ij2mk(i, j):
 
 
 @njit
-def compute_cpu_laplacian_(N, bc=False, dtype=np.float64):
+def _compute_cpu_laplacian(N, bc=False, dtype=np.float64):
     """
     Compute tridiagonal laplacian.
 
     Parameters
     ----------
     N: int
-    lap: int or real array, shape (N, N, 2)
-        If int, then N = lap and the actual array is created.
-        Two outer indices: corresponding to matrix entries in W.
-        Inner index: 0: 0th diagonal, 1: 1:st and -1:st diagonal.
+        Quantization matrix size.
     bc: bool (optional)
         Whether boundary conditions should be added to make the laplacian non-singular.
         Notice that this bc is different from the one used for sparse laplacians.
@@ -72,6 +69,8 @@ def compute_cpu_laplacian_(N, bc=False, dtype=np.float64):
     Returns
     -------
     lap: real array (N, N, 2)
+        Two outer indices: corresponding to matrix entries in W.
+        Inner index: 0: 0th diagonal, 1: 1:st and -1:st diagonal.
     """
     lap = np.zeros((N, N, 2), dtype=dtype)
 
@@ -84,15 +83,22 @@ def compute_cpu_laplacian_(N, bc=False, dtype=np.float64):
             lap[i, j, 1] = np.sqrt(((k + absm)*(N - k - absm))*(k*(N - k)))
 
     if bc:
-        lap[0, 0, 0] += 0.5
+        # Old bc
+        # lap[0, 0, 0] += 0.5
+
+        # Better bc (makes matrix definite)
+        lap[0, 0, 0] -= 0.5
+
+        # Experimental bc (not working yet)
+        # lap[-1, -1, 1] = 0.0
 
     return lap
 
 
-@njit(error_model='numpy', fastmath=True)
-def dot_cpu_generic_(lap, P, W):
+@njit(parallel=False, error_model='numpy', fastmath=True)
+def _dot_cpu_generic(lap, P, W):
     N = P.shape[0]
-    for i in range(N):
+    for i in prange(N):
         for j in range(N):
             W[i, j] = lap[i, j, 0]*P[i, j]
             if i < N-1 and j < N-1:
@@ -103,7 +109,7 @@ def dot_cpu_generic_(lap, P, W):
 
 
 @njit(parallel=False, error_model='numpy', fastmath=True)
-def dot_cpu_skewh2_(lap, P, W):
+def _dot_cpu_skewh2(lap, P, W):
     N = P.shape[0]
     for i in prange(N):
         for j in range(i):
@@ -116,8 +122,8 @@ def dot_cpu_skewh2_(lap, P, W):
     return W
 
 
-@njit(parallel=True, error_model='numpy', fastmath=True)
-def dot_cpu_nonskewh_(lap, P, W):
+@njit(parallel=False, error_model='numpy', fastmath=True)
+def _dot_cpu_nonskewh(lap, P, W):
     """
     Dot product for tridiagonal operator.
 
@@ -149,8 +155,8 @@ def dot_cpu_nonskewh_(lap, P, W):
     return W
 
 
-@njit(parallel=False, error_model='numpy', fastmath=True)
-def dot_cpu_skewh_(lap, P, W):
+@njit(parallel=True, error_model='numpy', fastmath=True)
+def _dot_cpu_skewh(lap, P, W):
     """
     Dot product for tridiagonal operator, for skew-Hermitian P.
 
@@ -179,7 +185,7 @@ def dot_cpu_skewh_(lap, P, W):
             W[i, j] = lap[i, j, 0]*P[i, j] + lap[i, j, 1]*P[i-1, j-1]
 
     # Make skewh from upper triangular part
-    for i in range(N):
+    for i in prange(N):
         for j in range(i):
             W[i, j] = -np.conj(W[j, i])
 
@@ -187,12 +193,12 @@ def dot_cpu_skewh_(lap, P, W):
 
 
 # Set default dot product
-# dot_cpu_ = dot_cpu_skewh_
-dot_cpu_ = dot_cpu_generic_
+# _dot_cpu = _dot_cpu_skewh
+_dot_cpu = _dot_cpu_generic
 
 
 @njit(parallel=True, error_model='numpy', fastmath=True)
-def solve_cpu_nonskewh_(lap, W, P, buffer_float, buffer_complex):
+def _solve_cpu_nonskewh(lap, W, P, buffer_float, buffer_complex):
     """
     Function for solving the quantized
     Poisson equation (or more generally the equation defined by
@@ -218,11 +224,18 @@ def solve_cpu_nonskewh_(lap, W, P, buffer_float, buffer_complex):
     for m in prange(-N+1, N):
 
         absm = np.abs(m)
-
+        
         # Initialize buffers
         i, j = mk2ij(m, 0)
         buffer_float[i, j] = lap[i, j, 0]
         buffer_complex[i, j] = W[i, j]
+        if m==0:
+            # Compute circulation (scaled trace) of W matrix
+            trW = W[0, 0]
+            for k in range(1, N):
+                trW += W[k, k]
+            trW /= N        
+            buffer_complex[i, j] -= trW
 
         # Forward sweep
         for k in range(1, N-absm):
@@ -232,6 +245,8 @@ def solve_cpu_nonskewh_(lap, W, P, buffer_float, buffer_complex):
             w = lap[i, j, 1]/buffer_float[im, jm]
             buffer_float[i, j] = lap[i, j, 0] - w*lap[i, j, 1]
             buffer_complex[i, j] = W[i, j] - w*buffer_complex[im, jm]
+            if m==0:
+                buffer_complex[i, j] -= trW
 
         # Backward sweep
         i, j = mk2ij(m, N-absm-1)
@@ -243,19 +258,28 @@ def solve_cpu_nonskewh_(lap, W, P, buffer_float, buffer_complex):
             P[i, j] = (buffer_complex[i, j] - lap[ip, jp, 1]*P[ip, jp])/buffer_float[i, j]
             # P[j, i] = np.conj(P[i, j])
 
-    # Make sure the trace of P vanishes (corresponds to bc for laplacian)
-    trP = P[0, 0]
-    for k in range(1, N):
-        trP += P[k, k]
-    trP /= N
-    for k in range(N):
-        P[k, k] -= trP
+        if m==0:
+            # Make sure the trace of P vanishes (corresponds to bc for laplacian)
+            trP = P[0, 0]
+            for k in range(1, N):
+                trP += P[k, k]
+            trP /= N
+            for k in range(N):
+                P[k, k] -= trP
+
+    # # Make sure the trace of P vanishes (corresponds to bc for laplacian)
+    # trP = P[0, 0]
+    # for k in range(1, N):
+    #     trP += P[k, k]
+    # trP /= N
+    # for k in range(N):
+    #     P[k, k] -= trP
 
     return P
 
 
 @njit(parallel=True, error_model='numpy', fastmath=True)
-def solve_cpu_skewh_(lap, W, P, buffer_float, buffer_complex):
+def _solve_cpu_skewh(lap, W, P, buffer_float, buffer_complex):
     """
     Function for solving the quantized
     Poisson equation (or more generally the equation defined by
@@ -284,6 +308,13 @@ def solve_cpu_skewh_(lap, W, P, buffer_float, buffer_complex):
         i, j = mk2ij(m, 0)
         buffer_float[i, j] = lap[i, j, 0]
         buffer_complex[i, j] = W[i, j]
+        if m==0:
+            # Compute circulation (scaled trace) of W matrix
+            trW = W[0, 0]
+            for k in range(1, N):
+                trW += W[k, k]
+            trW /= N        
+            buffer_complex[i, j] -= trW
 
         # Forward sweep
         for k in range(1, N-m):
@@ -293,6 +324,8 @@ def solve_cpu_skewh_(lap, W, P, buffer_float, buffer_complex):
             w = lap[i, j, 1]/buffer_float[im, jm]
             buffer_float[i, j] = lap[i, j, 0] - w*lap[i, j, 1]
             buffer_complex[i, j] = W[i, j] - w*buffer_complex[im, jm]
+            if m==0:
+                buffer_complex[i, j] -= trW
 
         # Backward sweep
         i, j = mk2ij(m, N-m-1)
@@ -305,20 +338,32 @@ def solve_cpu_skewh_(lap, W, P, buffer_float, buffer_complex):
             P[i, j] = (buffer_complex[i, j] - lap[ip, jp, 1]*P[ip, jp])/buffer_float[i, j]
             if m != 0:
                 P[j, i] = -np.conj(P[i, j])
+        
+        if m==0:
+            # Experimental bc
+            # P[-1, -1] = 0.0
 
-    # Make sure the trace of P vanishes (corresponds to bc for laplacian)
-    trP = P[0, 0]
-    for k in range(1, N):
-        trP += P[k, k]
-    trP /= N
-    for k in range(N):
-        P[k, k] -= trP
+            # Make sure the trace of P vanishes (corresponds to bc for laplacian)
+            trP = P[0, 0]
+            for k in range(1, N):
+                trP += P[k, k]
+            trP /= N
+            for k in range(N):
+                P[k, k] -= trP
+
+    # # Make sure the trace of P vanishes (corresponds to bc for laplacian)
+    # trP = P[0, 0]
+    # for k in range(1, N):
+    #     trP += P[k, k]
+    # trP /= N
+    # for k in range(N):
+    #     P[k, k] -= trP
 
     return P
 
 
 @njit(parallel=True, error_model='numpy', fastmath=True)
-def solve_cpu_generic_(lap, W, P, buffer_float, buffer_complex):
+def _solve_cpu_generic(lap, W, P, buffer_float, buffer_complex):
     """
 
     Parameters
@@ -361,14 +406,27 @@ def solve_cpu_generic_(lap, W, P, buffer_float, buffer_complex):
         # First element: k = m
         val_float = lap_flat[m, 0]
         val_complex = W_flat[m]
+        if m == 0:
+            # Compute scaled trace
+            trW = W_flat[0]
+            for k in range(stride, N**2, stride):
+                trW += W_flat[k]
+            trW /= N
+
+            # Correct diagonal
+            val_complex -= trW
+
         buffer_float_flat[m] = val_float
-        buffer_complex_flat[m] = val_complex
+        buffer_complex_flat[m] = val_complex            
 
         # Forward sweep according to grid-stride
         for k in range(m + stride, N**2, stride):
             w = lap_flat[k, 1]/val_float
             val_float = lap_flat[k, 0] - w*lap_flat[k, 1]
             val_complex = W_flat[k] - w*val_complex
+            if m == 0:
+                # Correct diagonal
+                val_complex -= trW
             buffer_float_flat[k] = val_float
             buffer_complex_flat[k] = val_complex
             k_last = k
@@ -382,21 +440,22 @@ def solve_cpu_generic_(lap, W, P, buffer_float, buffer_complex):
             val_complex = P_flat[k]
             val_float = lap_flat[k, 1]
 
-    # Make sure the trace of P vanishes (corresponds to bc for laplacian)
-    trP = P_flat[::N+1].sum()
-    trP /= N
-    P_flat[::N+1] -= trP
+        if m == 0:
+            # Make sure the trace of P vanishes (corresponds to bc for laplacian)
+            trP = P_flat[::stride].sum()
+            trP /= N
+            P_flat[::stride] -= trP
 
     return P
 
 
 # Set default solver
-solve_cpu_ = solve_cpu_skewh_
-# solve_cpu_ = solve_cpu_generic_
+_solve_cpu = _solve_cpu_skewh
+# _solve_cpu = _solve_cpu_generic
 
 
 @njit(error_model='numpy', fastmath=True)
-def dot_cpu_m_diag_(lap, P_m_diag, W_m_diag,):
+def _dot_cpu_m_diag(lap, P_m_diag, W_m_diag,):
     """
     Dot product for tridiagonal operator applied to m diagonal.
 
@@ -430,7 +489,7 @@ def dot_cpu_m_diag_(lap, P_m_diag, W_m_diag,):
 
 
 @njit(error_model='numpy', fastmath=True)
-def solve_cpu_m_diag_(lap, W_m_diag, P_m_diag):
+def _solve_cpu_m_diag(lap, W_m_diag, P_m_diag):
     """
     Solve Poisson equation for only m diagonal.
 
@@ -514,20 +573,20 @@ def select_skewherm(flag):
     -------
     previous flag (bool)
     """
-    global solve_cpu_
-    global dot_cpu_
+    global _solve_cpu
+    global _dot_cpu
     oldflag = False
-    if solve_cpu_ is solve_cpu_skewh_:
+    if _solve_cpu is _solve_cpu_skewh:
         oldflag = True
 
     if flag:
-        solve_cpu_ = solve_cpu_skewh_
-        if dot_cpu_ is dot_cpu_nonskewh_:
-            dot_cpu_ = dot_cpu_skewh_
+        _solve_cpu = _solve_cpu_skewh
+        if _dot_cpu is _dot_cpu_nonskewh:
+            _dot_cpu = _dot_cpu_skewh
     else:
-        solve_cpu_ = solve_cpu_nonskewh_
-        if dot_cpu_ is dot_cpu_skewh_:
-            dot_cpu_ = dot_cpu_nonskewh_
+        _solve_cpu = _solve_cpu_nonskewh
+        if _dot_cpu is _dot_cpu_skewh:
+            _dot_cpu = _dot_cpu_nonskewh
 
     return oldflag
 
@@ -560,7 +619,7 @@ def laplacian(N, bc=False, dtype=np.float64):
     global _cpu_laplacian_cache
 
     if (N, bc, dtype) not in _cpu_laplacian_cache:
-        lap = compute_cpu_laplacian_(N, bc=bc, dtype=dtype)
+        lap = _compute_cpu_laplacian(N, bc=bc, dtype=dtype)
         _cpu_laplacian_cache[(N, bc, dtype)] = lap
 
     return _cpu_laplacian_cache[(N, bc, dtype)]
@@ -598,14 +657,14 @@ def laplace(P):
             W = P.copy()
             for P_diag_m, W_diag_m, m in zip(P.data, W.data, P.offsets):
                 if m < 0:
-                    dot_cpu_m_diag_(lap, P_diag_m[:N+m], W_diag_m[:N+m])
+                    _dot_cpu_m_diag(lap, P_diag_m[:N+m], W_diag_m[:N+m])
                 else:
-                    dot_cpu_m_diag_(lap, P_diag_m[m:], W_diag_m[m:])
+                    _dot_cpu_m_diag(lap, P_diag_m[m:], W_diag_m[m:])
     else:
         # Full matrix
         lap = laplacian(N, dtype=type(P[0, 0].real))
         W = np.zeros_like(P)
-        dot_cpu_(lap, P, W)
+        _dot_cpu(lap, P, W)
 
     return W
 
@@ -659,13 +718,13 @@ def solve_poisson(W, reduce=select_first):
             P = W.copy()
             for W_diag_m, P_diag_m, m in zip(W.data, P.data, W.offsets):
                 if m < 0:
-                    solve_cpu_m_diag_(lap, W_diag_m[:N+m], P_diag_m[:N+m])
+                    _solve_cpu_m_diag(lap, W_diag_m[:N+m], P_diag_m[:N+m])
                 else:
-                    solve_cpu_m_diag_(lap, W_diag_m[m:], P_diag_m[m:])
+                    _solve_cpu_m_diag(lap, W_diag_m[m:], P_diag_m[m:])
     else:
         lap = laplacian(N, bc=True, dtype=type(W[0, 0].real))
         P = _get_cache(W_shape, W.dtype)
-        solve_cpu_(lap, W, P,
+        _solve_cpu(lap, W, P,
                 # _cpu_buffer_cache[N]['float'],
                 _get_cache(W_shape, W.dtype, "real"),
                 # _cpu_buffer_cache[N]['complex']
@@ -715,7 +774,7 @@ def solve_heat(h_times_nu, W0):
         heat = _cpu_heat_cache[(N, h_times_nu)]
 
     Wh = _cpu_buffer_cache[N]['P']
-    solve_cpu_(heat, W0, Wh,
+    _solve_cpu(heat, W0, Wh,
                _cpu_buffer_cache[N]['float'],
                _cpu_buffer_cache[N]['complex'])
 
@@ -760,7 +819,7 @@ def solve_helmholtz(W, alpha=1.0):
         helmholtz = _cpu_helmholtz_cache[(N, alpha)]
 
     P = _cpu_buffer_cache[N]['P']
-    solve_cpu_(helmholtz, W, P,
+    _solve_cpu(helmholtz, W, P,
                _cpu_buffer_cache[N]['float'],
                _cpu_buffer_cache[N]['complex'])
 
@@ -811,7 +870,7 @@ def solve_globalqg(W, gamma=1.0):
         globalqg = _cpu_globalqg_cache[(N, gamma)]
 
     P = _cpu_buffer_cache[N]['P']
-    solve_cpu_(globalqg, W, P,
+    _solve_cpu(globalqg, W, P,
                _cpu_buffer_cache[N]['float'],
                _cpu_buffer_cache[N]['complex'])
 
@@ -877,7 +936,7 @@ def solve_viscdamp(h, W0, nu=1e-4, alpha=0.01, force=None, theta=1):
     if force is not None:
         Wrhs += h*force
 
-    solve_cpu_(viscdamp, Wrhs, Wh,
+    _solve_cpu(viscdamp, Wrhs, Wh,
                _cpu_buffer_cache[N]['float'],
                _cpu_buffer_cache[N]['complex'])
 
