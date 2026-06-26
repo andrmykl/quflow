@@ -112,7 +112,11 @@ def compute_sparse_laplacian(N, bc=False):
     A: scipy.sparse.spmatrix
         Sparse matrix in some scipy format (typically `csc_matrix`).
     """
-    values = np.zeros(3*N**2-4*N+2+N, dtype=complex)  # Used to be 'complex' but no need for that
+    nnz = 3 * N**2 - 4 * N + 2
+    if bc:
+        nnz += 2 * N - 1
+
+    values = np.zeros(nnz, dtype=complex)  # Used to be 'complex' but no need for that
     ivals = np.zeros(values.shape, dtype=int)
     jvals = np.zeros(values.shape, dtype=int)
 

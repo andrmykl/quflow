@@ -141,6 +141,16 @@ def test_sparse_laplacian_respects_bc_flag():
     assert np.linalg.matrix_rank(A_bc) == N**2
 
 
+@pytest.mark.parametrize("N", [8, 32])
+def test_sparse_laplacian_bc_allocates_enough_indices_for_even_N(N):
+    A_bc = qusparse.compute_sparse_laplacian(N, bc=True)
+
+    assert A_bc.shape == (N**2, N**2)
+    assert A_bc.nnz > qusparse.compute_sparse_laplacian(N, bc=False).nnz
+    assert A_bc.indices.min() >= 0
+    assert A_bc.indices.max() < N**2
+
+
 @pytest.mark.parametrize("N", [2, 33, 65, 128])
 @pytest.mark.parametrize("qulap", [qudirect, qucpu, qugpu, qusparse, qutridiagonal])
 @pytest.mark.parametrize("skewh", [True, False])
