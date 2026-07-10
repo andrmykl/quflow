@@ -300,8 +300,17 @@ def plot(data, fig=None, ax=None,
     # add text with time-tag
     if time is not None:
         # place a text box in upper left in axes coords
-        textstr = "time: {:.2f}".format(time)
-        ax.text(0.05, 0.95, textstr, transform=ax.transAxes, verticalalignment='top')
+        if isinstance(time, str):
+            textstr = time
+        elif abs(time) < 100:
+            textstr = "t={:.1f}".format(time)
+        else:
+            textstr = "t={:.0f}".format(time)
+        # textstr = time if isinstance(time, str) else "t = {:.1f}".format(time)
+        timetag = get_time_tag(textstr, ax=ax, scale_factor=None)
+
+        # textstr = "time: {:.2f}".format(time)
+        # ax.text(0.05, 0.95, textstr, transform=ax.transAxes, verticalalignment='top')
     if colorbar:
         im.figure.colorbar(mappable=im, cax=cax)
 
@@ -370,6 +379,21 @@ def _get_ffmpeg_args(preset, extra_args, codec):
             extra_args += ['-preset', 'veryslow']
     
     return extra_args
+
+
+def get_time_tag(textstr, ax, scale_factor=None):
+    bbox = ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted())
+    width, height = bbox.width, bbox.height
+    # fig_width, fig_height = self.figure.get_size_inches()
+    if scale_factor is None:
+        scale_factor = width / 8  # Assuming 8 is the base size
+    else:
+        scale_factor = scale_factor*width/8
+    timetag = ax.text(0.01, 0.91, textstr, 
+                            transform=ax.transAxes, 
+                            verticalalignment='baseline',
+                            fontsize=24*scale_factor)
+    return timetag
 
 
 class Animation(object):
@@ -565,15 +589,16 @@ class Animation(object):
                 textstr = "t={:.0f}".format(time)
             # textstr = time if isinstance(time, str) else "t = {:.1f}".format(time)
             if not hasattr(self, 'timetag'):
-                ax = im.axes
-                bbox = ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted())
-                width, height = bbox.width, bbox.height
-                # fig_width, fig_height = self.figure.get_size_inches()
-                scale_factor = width / 8  # Assuming 8 is the base size
-                self.timetag = ax.text(0.01, 0.91, textstr, 
-                                       transform=ax.transAxes, 
-                                       verticalalignment='baseline',
-                                       fontsize=24*scale_factor)
+                self.timetag = get_time_tag(textstr, ax=im.axes, scale_factor=None)
+                # ax = im.axes
+                # bbox = ax.get_window_extent().transformed(ax.figure.dpi_scale_trans.inverted())
+                # width, height = bbox.width, bbox.height
+                # # fig_width, fig_height = self.figure.get_size_inches()
+                # scale_factor = width / 8  # Assuming 8 is the base size
+                # self.timetag = ax.text(0.01, 0.91, textstr, 
+                #                        transform=ax.transAxes, 
+                #                        verticalalignment='baseline',
+                #                        fontsize=24*scale_factor)
             else:
                 self.timetag.set_text(textstr)
 
