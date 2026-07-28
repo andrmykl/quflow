@@ -339,7 +339,7 @@ class IsompCUDA(object):
                 W += FW
         
             if time is not None:
-                time += dt.get()
+                time += dt
 
             # Apply half a Strang step
             if strang_splitting:
