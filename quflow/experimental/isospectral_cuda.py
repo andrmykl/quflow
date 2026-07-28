@@ -213,14 +213,6 @@ class IsompCUDA(object):
         vareps = dt/(2*hb)
         zero_real = 0.0
 
-        # Convert constants to single precision if needed
-        if self.Phalf.dtype == cp.complex64:
-            hb = cp.float32(hb)
-            vareps = cp.float32(vareps)
-            zero_real = cp.float32(zero_real)
-            dt = cp.float32(dt)
-            tol = cp.float32(tol)
-
         # Specify tolerance if needed
         if (tol == 'auto') or (tol < 0):
             mach_eps = cp.finfo(W.dtype).eps
@@ -235,11 +227,19 @@ class IsompCUDA(object):
             if verbatim:
                 print("Tolerance set to {}.".format(tol))
             if stats:
-                stats['tol'] = tol.get()
+                stats['tol'] = tol
 
-        # Convert tolerance to single precision if needed
+
+        # Convert constants to single precision if needed
         if self.Phalf.dtype == cp.complex64:
-            tol = cp.float32(tol)
+            cpfloat = cp.float32
+        else:
+            cpfloat = cp.float64
+        hb = cpfloat(hb)
+        vareps = cpfloat(vareps)
+        zero_real = cpfloat(zero_real)
+        dt = cpfloat(dt)
+        tol = cpfloat(tol)
 
         # Get stream
         stream = cp.cuda.get_current_stream()
