@@ -3,6 +3,8 @@ r"""Commutator constraints for the quantized Poisson equation.
 See ``docs/constraints.md`` for construction modes and derivations.
 """
 
+from collections.abc import Mapping
+
 import numpy as np
 import scipy.linalg
 import scipy.linalg.interpolative
@@ -14,7 +16,9 @@ import quflow as qf
 
 __all__ = [
     "CommutatorPoissonSolver",
+    "ConstraintPlotter",
     "constraint_matrix",
+    "plotter",
     "spectral_matrix",
     "trace_free_block_projector",
 ]
@@ -329,6 +333,311 @@ def trace_free_block_projector(
         return projected - (trace / water_rank)[..., None, None] * water_projector
 
     return project
+
+
+# Constraint-aware plotting
+
+
+class ConstraintPlotter:
+    """Plot states with fixed level-set contours and an optional subtraction.
+
+    Instances are callable and return the image artist created by
+    :func:`quflow.plot`.  The same instance can be supplied to
+    :class:`quflow.Animation` through its ``plotter`` argument, which keeps
+    the contours fixed while updating the state beneath them.
+
+    ``subtract_function`` is interpreted as a fixed field.  If it is
+    callable, it is evaluated once on a zero array shaped like the first
+    constraint function.  This makes it possible to pass the affine callable
+    returned by :func:`trace_free_block_projector`; only its constant part is
+    removed, rather than applying the projector to every animation frame.
+
+    Plotting uses at least ``min_N=256`` samples in latitude (and ``2*N-1``
+    in longitude).  Above that floor, ``N`` is inherited from the plotted
+    state unless supplied explicitly.  Set ``min_N=None`` to allow lower
+    plotting resolutions.
+    """
+
+    def __init__(
+        self,
+        functions,
+        level_sets,
+        subtract_function=None,
+        *,
+        min_N=256,
+        contour_kwargs=None,
+        **plot_kwargs,
+    ):
+        self.functions = tuple(np.array(F, copy=True) for F in functions)
+        self.level_sets = np.asarray(level_sets, dtype=float).ravel()
+        if not self.functions:
+            raise ValueError("functions and level_sets must not be empty.")
+        if len(self.functions) != self.level_sets.size:
+            raise ValueError("functions and level_sets must have equal lengths.")
+        if not np.isfinite(self.level_sets).all():
+            raise ValueError("level_sets must be finite real values.")
+
+        reference = self.functions[0]
+        if subtract_function is None:
+            self.subtract_function = None
+        else:
+            if callable(subtract_function):
+                subtract_function = subtract_function(np.zeros_like(reference))
+            subtraction = np.asarray(subtract_function)
+            if subtraction.shape != reference.shape:
+                raise ValueError(
+                    "subtract_function must have the same shape as "
+                    f"functions[0], got {subtraction.shape} and "
+                    f"{reference.shape}."
+                )
+            self.subtract_function = np.array(subtraction, copy=True)
+
+        self.min_N = self._validate_resolution(min_N, "min_N", allow_none=True)
+        self.contour_kwargs = self._normalize_contour_kwargs(contour_kwargs)
+        self.plot_kwargs = dict(plot_kwargs)
+        self._validate_plot_kwargs(self.plot_kwargs)
+        if self.plot_kwargs.get("N") is not None:
+            self._validate_resolution(self.plot_kwargs["N"], "N")
+        self._contour_fun_cache = {}
+
+    @staticmethod
+    def _validate_resolution(value, name, *, allow_none=False):
+        if value is None and allow_none:
+            return None
+        error_message = f"{name} must be a positive integer"
+        if np.iscomplexobj(value):
+            raise ValueError(error_message)
+        try:
+            resolution = int(value)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(error_message) from error
+        if (
+            np.ndim(value) != 0
+            or isinstance(value, (bool, np.bool_))
+            or resolution != value
+            or resolution < 1
+        ):
+            raise ValueError(error_message)
+        return resolution
+
+    @staticmethod
+    def _infer_resolution(state):
+        """Infer spherical bandwidth from matrix, function, or coefficients."""
+        state = np.asarray(state)
+        if state.ndim == 2:
+            if state.shape[0] < 1:
+                raise ValueError("Cannot infer N from an empty state.")
+            return state.shape[0]
+        if state.ndim == 1 and state.size:
+            return int(np.ceil(np.sqrt(state.size)))
+        raise ValueError(
+            "Cannot infer N: state must be a nonempty one- or two-dimensional "
+            "array."
+        )
+
+    def _resolve_resolution(self, state, N=None):
+        if N is None:
+            N = self._infer_resolution(state)
+        else:
+            N = self._validate_resolution(N, "N")
+        if self.min_N is not None:
+            N = max(N, self.min_N)
+        return N
+
+    @staticmethod
+    def _validate_plot_kwargs(plot_kwargs):
+        reserved = {"contours", "contour_data", "contour_kwargs"}
+        unsupported = reserved.intersection(plot_kwargs)
+        if unsupported:
+            names = ", ".join(sorted(unsupported))
+            raise ValueError(
+                f"{names} cannot be used with ConstraintPlotter; configure "
+                "the fixed level-set contours when constructing the plotter."
+            )
+
+    def _normalize_contour_kwargs(self, contour_kwargs):
+        """Return one independent contour keyword dictionary per field."""
+        if contour_kwargs is None:
+            kwargs_per_contour = [{} for _ in self.functions]
+        elif isinstance(contour_kwargs, Mapping):
+            kwargs_per_contour = [
+                dict(contour_kwargs) for _ in self.functions
+            ]
+        else:
+            try:
+                kwargs_per_contour = [dict(kwargs) for kwargs in contour_kwargs]
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "contour_kwargs must be a mapping or one mapping per "
+                    "constraint function."
+                ) from error
+            if len(kwargs_per_contour) != len(self.functions):
+                raise ValueError(
+                    "A contour_kwargs sequence must have one entry per "
+                    "constraint function."
+                )
+
+        for kwargs in kwargs_per_contour:
+            if "levels" in kwargs:
+                raise ValueError(
+                    "contour levels are set by level_sets, not contour_kwargs."
+                )
+        return tuple(kwargs_per_contour)
+
+    def prepare(self, state):
+        """Return the state after removing the configured fixed field."""
+        state = np.asarray(state)
+        if self.subtract_function is None:
+            return state
+        try:
+            return state - self.subtract_function
+        except ValueError as error:
+            raise ValueError(
+                f"state shape {state.shape} is incompatible with subtraction "
+                f"shape {self.subtract_function.shape}."
+            ) from error
+
+    def _contour_functions(self, N):
+        """Convert and cache all contour fields at plotting resolution ``N``."""
+        cache_key = None if N is None else int(N)
+        if cache_key not in self._contour_fun_cache:
+            contour_functions = []
+            for field in self.functions:
+                if N is not None:
+                    field = qf.graphics.resample(field, N)
+                contour_fun = qf.as_fun(field)
+                if np.iscomplexobj(contour_fun):
+                    contour_fun = contour_fun.real
+                contour_functions.append(contour_fun)
+            self._contour_fun_cache[cache_key] = tuple(contour_functions)
+        return self._contour_fun_cache[cache_key]
+
+    @staticmethod
+    def _uses_cartopy(ax):
+        """Return whether ``ax`` expects geographic data in degrees."""
+        return qf.graphics._is_cartopy_axes(ax)
+
+    def _draw_contours(self, ax, N, user_annotate=None):
+        use_cartopy = self._uses_cartopy(ax)
+        for contour_fun, level, user_kwargs in zip(
+            self._contour_functions(N),
+            self.level_sets,
+            self.contour_kwargs,
+        ):
+            lon = np.linspace(
+                -np.pi,
+                np.pi,
+                contour_fun.shape[1],
+                endpoint=False,
+            )
+            lat = np.linspace(
+                -np.pi / 2,
+                np.pi / 2,
+                contour_fun.shape[0],
+            )
+            kwargs = {
+                "colors": "black",
+                "linewidths": 1.0,
+                "negative_linestyles": "solid",
+            }
+            kwargs.update(user_kwargs)
+            kwargs["levels"] = [level]
+            if use_cartopy:
+                lon = np.rad2deg(lon)
+                lat = np.rad2deg(lat)
+                kwargs.setdefault("transform", qf.graphics.ccrs.PlateCarree())
+            ax.contour(lon, lat, contour_fun, **kwargs)
+
+        if user_annotate is not None:
+            user_annotate(ax)
+
+    def __call__(self, state, **plot_kwargs):
+        """Plot ``state`` with the configured subtraction and contours."""
+        kwargs = {**self.plot_kwargs, **plot_kwargs}
+        self._validate_plot_kwargs(kwargs)
+        N = self._resolve_resolution(state, kwargs.get("N"))
+        kwargs["N"] = N
+        user_annotate = kwargs.pop("annotate", None)
+        im = qf.plot(self.prepare(state), **kwargs)
+        im.axes.set_autoscale_on(False)
+        self._draw_contours(im.axes, N, user_annotate=user_annotate)
+        im._quflow_constraint_plotter_N = N
+        return im
+
+    def update(self, im, state, *, N=None):
+        """Update ``im`` without redrawing contours or changing resolution."""
+        image_N = getattr(im, "_quflow_constraint_plotter_N", None)
+        if image_N is not None:
+            if N is not None:
+                requested_N = self._resolve_resolution(state, N)
+                if requested_N != image_N:
+                    raise ValueError(
+                        f"Cannot update an image created with N={image_N} "
+                        f"using N={requested_N}. Create a new image to change "
+                        "plotting resolution."
+                    )
+            N = image_N
+        elif N is None:
+            N = self.plot_kwargs.get("N")
+        N = self._resolve_resolution(state, N)
+
+        data = self.prepare(state)
+        if N is not None:
+            data = qf.graphics.resample(data, N)
+        fun = qf.as_fun(data)
+        if np.iscomplexobj(fun):
+            fun = fun.real
+
+        if hasattr(im, "get_array") and np.size(im.get_array()) != fun.size:
+            raise ValueError(
+                "The updated state has a different plotting resolution from "
+                "the existing image. Pass a consistent N to the plotter and "
+                "Animation."
+            )
+        if hasattr(im, "set_data"):
+            im.set_data(fun)
+        elif hasattr(im, "set_array"):
+            im.set_array(fun.ravel())
+        else:
+            raise AttributeError("Could not find method for setting data.")
+        return im
+
+
+def plotter(
+    functions,
+    level_sets,
+    subtract_function=None,
+    *,
+    min_N=256,
+    contour_kwargs=None,
+    **plot_kwargs,
+):
+    """Return a reusable :class:`ConstraintPlotter`.
+
+    The effective plotting bandwidth is ``max(256, N)`` by default.  If ``N``
+    is omitted, it is inferred from each initial state.  Set ``min_N=None``
+    to disable the default floor.
+
+    Examples
+    --------
+    ``project`` may be the callable returned by
+    :func:`trace_free_block_projector`::
+
+        cplot = plotter(functions, level_sets, project, N=N)
+        cplot(W0)
+
+        with qf.Animation("simulation.mp4", plotter=cplot) as animation:
+            for state, time in zip(states, times):
+                animation.update(state, time=time)
+    """
+    return ConstraintPlotter(
+        functions,
+        level_sets,
+        subtract_function,
+        min_N=min_N,
+        contour_kwargs=contour_kwargs,
+        **plot_kwargs,
+    )
 
 
 # Constrained Poisson solver
