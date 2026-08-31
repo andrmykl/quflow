@@ -758,59 +758,40 @@ class CommutatorPoissonSolver:
             return
 
         N = self.matrix_size
-        rank = self.constraint_rank
-        V = self.constraint_row_basis
-        V_adjoint = V.conj().T.tocsr()
-        dtype = np.result_type(V.dtype, np.complex128)
-        schur = np.empty((rank, rank), dtype=dtype)
+        V = self.constraint_row_basis.astype(complex, copy=False)
+        schur = np.empty(
+            (self.constraint_rank, self.constraint_rank), dtype=complex
+        )
 
         previous_mode = qf.laplacian.cpu.select_skewherm(False)
         try:
-            for column in range(rank):
-                rhs = np.asarray(
-                    V_adjoint[:, column].toarray(), dtype=dtype
-                ).reshape(N, N)
-                inverse_rhs = np.asarray(qf.solve_poisson(rhs), dtype=dtype)
-                schur[:, column] = -(V @ inverse_rhs.ravel())
+            for column in range(self.constraint_rank):
+                P = qf.solve_poisson(
+                    V.getrow(column).conj().toarray().reshape(N, N)
+                )
+                schur[:, column] = -(V @ P.ravel())
         finally:
             qf.laplacian.cpu.select_skewherm(previous_mode)
 
         self._schur_factorization = scipy.linalg.lu_factor(schur)
 
-    def _solve_poisson_columns(self, rhs):
-        """Apply ``qf.solve_poisson`` separately to vectorized columns."""
-        solutions = np.empty(
-            rhs.shape, dtype=np.result_type(rhs.dtype, np.complex128)
-        )
-        N = self.matrix_size
-        for column in range(rhs.shape[1]):
-            W = np.asarray(rhs[:, column], dtype=solutions.dtype).reshape(N, N)
-            # Copy each result before qf.solve_poisson reuses its output cache.
-            solutions[:, column] = np.asarray(qf.solve_poisson(W)).ravel()
-        return solutions
-
     def solve(self, W):
-        """Solve the constrained Poisson equation for a matrix or batch."""
+        """Solve the constrained Poisson equation for one matrix."""
         W = np.asarray(W)
         N = self.matrix_size
-        if W.shape[-2:] != (N, N):
-            raise ValueError(f"W must end with shape {(N, N)}, got {W.shape}.")
+        if W.shape != (N, N):
+            raise ValueError(f"W must have shape {(N, N)}, got {W.shape}.")
 
-        rhs = W.reshape(-1, N**2).T
-        unconstrained = self._solve_poisson_columns(rhs)
+        W = W.astype(np.result_type(W.dtype, np.complex128), copy=False)
+        P = qf.solve_poisson(W)
 
         if self.constraint_rank:
             V = self.constraint_row_basis
-            schur_rhs = V @ unconstrained
+            schur_rhs = V @ P.ravel()
             multipliers = scipy.linalg.lu_solve(
                 self._schur_factorization, -schur_rhs
             )
-            correction = V.conj().T @ multipliers
-            solutions = self._solve_poisson_columns(rhs - correction)
-        else:
-            solutions = unconstrained
+            correction = (V.conj().T @ multipliers).reshape(N, N)
+            P = qf.solve_poisson(W - correction)
 
-        P = solutions.T.reshape(W.shape)
-        trace = np.trace(P, axis1=-2, axis2=-1)
-        P -= (trace / N)[..., None, None] * np.eye(N)
         return P
