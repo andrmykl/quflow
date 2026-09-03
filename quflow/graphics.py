@@ -12,9 +12,16 @@ from scipy.ndimage import map_coordinates
 
 try:
     import cartopy.crs as ccrs
+    from cartopy.mpl.geoaxes import GeoAxes
     _has_cartopy = True
 except ModuleNotFoundError:
+    GeoAxes = ()
     _has_cartopy = False
+
+
+def _is_cartopy_axes(ax):
+    """Return whether ``ax`` is a Cartopy geographic axes."""
+    return _has_cartopy and isinstance(ax, GeoAxes)
 
 def in_notebook():
     try:
@@ -188,6 +195,9 @@ def plot(data, fig=None, ax=None,
 
     use_cartopy = False
     cax = None
+
+    if ax is not None:
+        use_cartopy = _is_cartopy_axes(ax)
 
     # Convert and resample data if needed.
     if N is not None:
@@ -417,6 +427,10 @@ class Animation(object):
         Additional arguments to pass to FFmpeg.
     title : str, default "QUFLOW animation"
         Title metadata for the video file.
+    plotter : callable or None, optional
+        Reusable plotter for creating and updating the image. It must be
+        callable as ``plotter(state, **plot_kwargs)`` and provide an
+        ``update(im, state, N=None)`` method. Default is None.
     **kwargs : optional
         Additional keyword arguments passed to the plotting function (e.g., dpi).
     
@@ -468,6 +482,7 @@ class Animation(object):
                  codec: str = 'h264',
                  ffmpeg_args: str = None,
                  title: str = "QUFLOW animation",
+                 plotter = None,
                  **kwargs
                  ):
         
@@ -488,6 +503,15 @@ class Animation(object):
 
         # Plot image
         self.im = im
+
+        # Optional reusable plotter
+        if plotter is not None and (
+            not callable(plotter) or not callable(getattr(plotter, 'update', None))
+        ):
+            raise TypeError(
+                "plotter must be callable and provide an update(im, state) method."
+            )
+        self.plotter = plotter
 
         # Save quflow.plot arguments
         if 'dpi' not in kwargs:
@@ -561,13 +585,24 @@ class Animation(object):
 
         if state is not None:
             if im is None:
-                # Create default plot
-                fun = as_fun(state)
-                if self.N is not None:
-                    fun = resample(fun, self.N)
-                self.im = plot(fun, **self._plot_kwargs)
+                if self.plotter is None:
+                    # Create default plot
+                    fun = as_fun(state)
+                    if self.N is not None:
+                        fun = resample(fun, self.N)
+                    self.im = plot(fun, **self._plot_kwargs)
+                else:
+                    plot_kwargs = dict(self._plot_kwargs)
+                    if self.N is not None:
+                        plot_kwargs["N"] = self.N
+                    self.im = self.plotter(state, **plot_kwargs)
                 im = self.im
                 self.setup()
+            elif self.plotter is not None:
+                update_kwargs = {}
+                if self.N is not None:
+                    update_kwargs["N"] = self.N
+                self.plotter.update(im, state, **update_kwargs)
             else:
                 fun = as_fun(state)
                 if self.N is not None:
@@ -608,7 +643,7 @@ class Animation(object):
 
 
 
-def create_animation(filename, states, N=None, fps=25, preset='medium', extra_args=None,
+def create_animation(filename, states,constraint_animation_args=None, N=None, fps=25, preset='medium', extra_args=None,
                       codec='h264', title='QUFLOW animation',
                       progress_bar=True, progress_file=None, time=None, adaptive_scale=False, data2fun=as_fun, **kwargs):
     """
@@ -632,6 +667,45 @@ def create_animation(filename, states, N=None, fps=25, preset='medium', extra_ar
     -------
 
     """
+    if constraint_animation_args:
+        from .constraints import plotter
+
+        constraint_plotter = plotter(*constraint_animation_args, N=N)
+
+        if time is not None and len(time) != states.shape[0]:
+            raise ValueError("time and states must contain the same number of frames.")
+
+        if progress_bar and progress_file is None:
+            from tqdm import trange
+            stepiter = trange(states.shape[0], unit=' frames')
+        elif progress_bar:
+            from tqdm import trange
+            stepiter = trange(states.shape[0], unit=' frames',
+                              file=progress_file, ascii=True, mininterval=10.0)
+        else:
+            stepiter = range(states.shape[0])
+
+        with matplotlib.rc_context({'backend': 'Agg'}):
+            with Animation(
+                filename,
+                N=N,
+                fps=fps,
+                preset=preset,
+                codec=codec,
+                ffmpeg_args=extra_args,
+                title=title,
+                plotter=constraint_plotter,
+                **kwargs,
+            ) as animation:
+                for k in stepiter:
+                    frame_time = None if time is None else time[k]
+                    animation.update(states[k], time=frame_time)
+
+        if in_notebook():
+            from IPython.display import Video
+            return Video(filename, embed=False)
+        return None
+        
     FFMpegWriter = anim.writers['ffmpeg']
     title = title.replace('QUFLOW', filename.replace('.mp4', ''))
     metadata = dict(title=title, artist='Matplotlib', comment='http://github.com/klasmodin/quflow')

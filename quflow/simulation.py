@@ -531,6 +531,7 @@ filename = args.filename
 if filename is None:
     raise ValueError("filename must be specified (valid hdf5 file)")
 
+constraint_animation_args=[]
 # ---------- Externally defined code ----------
 
 {}
@@ -567,7 +568,7 @@ if not args.animate:
 
 # Create animation
 if not args.simulate:
-    qf.create_animation(args.filename.replace(".hdf5", ".mp4"), mysim['fun'])
+    qf.create_animation(args.filename.replace(".hdf5", ".mp4"), mysim['mat'],constraint_animation_args=constraint_animation_args)
 
 
 """.format(os.path.basename(sim.filename), sim['prerun'])
