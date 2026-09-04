@@ -564,7 +564,7 @@ if cuda_available and mysim['hamiltonian'] is qf.solve_poisson and mysim['integr
 
 # Run simulation
 if not args.animate:
-    qf.solve(mysim, **solve_kwargs)
+    qf.solve(mysim,hamiltonian=solver.solve, **solve_kwargs)
 
 # Create animation
 if not args.simulate:
