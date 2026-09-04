@@ -532,6 +532,7 @@ if filename is None:
     raise ValueError("filename must be specified (valid hdf5 file)")
 
 constraint_animation_args=[]
+solver = qf.solve_poisson
 # ---------- Externally defined code ----------
 
 {}
